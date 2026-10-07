@@ -1,17 +1,19 @@
 import random
-import math
+
 
 # ============================================================
 # PHYDISCOVER V1
-# Attempts to rediscover simple physics equations
-# using symbolic regression + evolution.
+#
+# Attempts to rediscover simple physics equations using
+# evolutionary symbolic regression.
 # ============================================================
 
 random.seed(42)
 
-# ------------------------------------------------------------
+
+# ============================================================
 # 1. Generate physics data
-# ------------------------------------------------------------
+# ============================================================
 
 def make_data():
 
@@ -23,6 +25,7 @@ def make_data():
 
     # F = ma
     for _ in range(30):
+
         m = random.uniform(1, 10)
         a = random.uniform(0.5, 10)
 
@@ -36,6 +39,7 @@ def make_data():
 
     # v = at
     for _ in range(30):
+
         a = random.uniform(0.5, 10)
         t = random.uniform(0.1, 10)
 
@@ -49,6 +53,7 @@ def make_data():
 
     # x = 1/2 at²
     for _ in range(30):
+
         a = random.uniform(0.5, 10)
         t = random.uniform(0.1, 10)
 
@@ -63,11 +68,119 @@ def make_data():
     return data
 
 
-# ------------------------------------------------------------
-# 2. Mathematical expression system
-# ------------------------------------------------------------
+# ============================================================
+# 2. Expression
+# ============================================================
 
-VARIABLES = ["m", "a", "t"]
+class Expression:
+
+    def __init__(
+        self,
+        value=None,
+        left=None,
+        op=None,
+        right=None
+    ):
+
+        self.value = value
+        self.left = left
+        self.op = op
+        self.right = right
+
+    # --------------------------------------------------------
+    # Is this expression just a variable/number?
+    # --------------------------------------------------------
+
+    def is_leaf(self):
+
+        return self.value is not None
+
+    # --------------------------------------------------------
+    # Evaluate expression
+    # --------------------------------------------------------
+
+    def evaluate(self, variables):
+
+        # Leaf node
+        if self.is_leaf():
+
+            # Variable
+            if isinstance(self.value, str):
+
+                # .get() prevents KeyError
+                return variables.get(self.value)
+
+            # Number
+            return self.value
+
+        # Evaluate left side
+        left = self.left.evaluate(variables)
+
+        # Evaluate right side
+        right = self.right.evaluate(variables)
+
+        # Invalid expression
+        if left is None or right is None:
+            return None
+
+        try:
+
+            if self.op == "+":
+                return left + right
+
+            elif self.op == "-":
+                return left - right
+
+            elif self.op == "*":
+                return left * right
+
+            elif self.op == "/":
+
+                if abs(right) < 1e-10:
+                    return None
+
+                return left / right
+
+        except (
+            ValueError,
+            ZeroDivisionError,
+            OverflowError
+        ):
+
+            return None
+
+        return None
+
+    # --------------------------------------------------------
+    # Convert expression to readable text
+    # --------------------------------------------------------
+
+    def __str__(self):
+
+        if self.is_leaf():
+
+            if isinstance(self.value, float):
+
+                return str(round(self.value, 3))
+
+            return str(self.value)
+
+        return (
+            f"({self.left} "
+            f"{self.op} "
+            f"{self.right})"
+        )
+
+
+# ============================================================
+# 3. Random expression generation
+# ============================================================
+
+VARIABLES = [
+    "m",
+    "a",
+    "t"
+]
 
 CONSTANTS = [
     0.5,
@@ -85,174 +198,149 @@ OPERATORS = [
 ]
 
 
-class Expression:
-
-    def __init__(self, value=None, left=None, op=None, right=None):
-        self.value = value
-        self.left = left
-        self.op = op
-        self.right = right
-
-    def is_leaf(self):
-        return self.value is not None
-
-
-    def evaluate(self, variables):
-
-        if self.is_leaf():
-
-            if isinstance(self.value, str):
-                return variables.get(self.value)
-
-            return self.value
-
-        left = self.left.evaluate(variables)
-        right = self.right.evaluate(variables)
-
-        # Invalid variable/expression
-        if left is None or right is None:
-            return None
-
-        try:
-
-            if self.op == "+":
-                return left + right
-
-            if self.op == "-":
-                return left - right
-
-            if self.op == "*":
-                return left * right
-
-            if self.op == "/":
-
-                if abs(right) < 1e-10:
-                    return None
-
-                return left / right
-
-        except (ValueError, ZeroDivisionError, OverflowError):
-            return None
-
-        return None
-
-
-    
-    def __str__(self):
-
-        if self.is_leaf():
-
-            if isinstance(self.value, float):
-                return str(round(self.value, 3))
-
-            return self.value
-
-        return f"({self.left} {self.op} {self.right})"
-
-
-# ------------------------------------------------------------
-# 3. Random expression generator
-# ------------------------------------------------------------
-
 def random_leaf():
 
+    # Usually choose a variable
     if random.random() < 0.7:
-        return Expression(value=random.choice(VARIABLES))
 
-    return Expression(value=random.choice(CONSTANTS))
+        return Expression(
+            value=random.choice(VARIABLES)
+        )
+
+    return Expression(
+        value=random.choice(CONSTANTS)
+    )
 
 
 def random_expression(depth=0):
 
-    # Stop growing the tree
-    if depth >= 3 or random.random() < 0.35:
+    # Stop recursion
+    if depth >= 3:
+
+        return random_leaf()
+
+    # Sometimes create a leaf
+    if random.random() < 0.35:
+
         return random_leaf()
 
     left = random_expression(depth + 1)
     right = random_expression(depth + 1)
 
-    op = random.choice(OPERATORS)
+    operator = random.choice(OPERATORS)
 
     return Expression(
         left=left,
-        op=op,
+        op=operator,
         right=right
     )
 
 
-# ------------------------------------------------------------
-# 4. Score an equation
-# ------------------------------------------------------------
+# ============================================================
+# 4. Score an expression
+# ============================================================
 
-def score_expression(expr, dataset, target):
+def score_expression(
+    expression,
+    dataset,
+    target
+):
 
-    error = 0
-    valid = 0
+    total_error = 0
+    valid_predictions = 0
 
     for row in dataset:
 
-        prediction = expr.evaluate(row)
+        prediction = expression.evaluate(row)
 
+        # Invalid equation
         if prediction is None:
             continue
 
         actual = row[target]
 
-        # Relative error
-        denominator = max(abs(actual), 1e-8)
-
-        relative_error = abs(prediction - actual) / denominator
-
-        error += relative_error
-        valid += 1
-
-    if valid == 0:
-        return float("inf")
-
-    # Slight penalty for complicated equations
-    complexity = len(str(expr)) * 0.0001
-
-    return error / valid + complexity
-
-
-# ------------------------------------------------------------
-# 5. Mutation
-# ------------------------------------------------------------
-
-def mutate(expr):
-
-    # Completely replace occasionally
-    if random.random() < 0.15:
-        return random_expression()
-
-    if expr.is_leaf():
-
-        if random.random() < 0.5:
-            return random_leaf()
-
-        return expr
-
-    # Mutate one side
-    if random.random() < 0.5:
-
-        return Expression(
-            left=mutate(expr.left),
-            op=expr.op,
-            right=expr.right
+        denominator = max(
+            abs(actual),
+            1e-8
         )
 
-    return Expression(
-        left=expr.left,
-        op=expr.op,
-        right=mutate(expr.right)
+        relative_error = (
+            abs(prediction - actual)
+            / denominator
+        )
+
+        total_error += relative_error
+
+        valid_predictions += 1
+
+    # Equation doesn't work
+    if valid_predictions == 0:
+
+        return float("inf")
+
+    average_error = (
+        total_error
+        / valid_predictions
+    )
+
+    # Slight complexity penalty
+    complexity_penalty = (
+        len(str(expression))
+        * 0.0001
+    )
+
+    return (
+        average_error
+        + complexity_penalty
     )
 
 
-# ------------------------------------------------------------
-# 6. Evolutionary search
-# ------------------------------------------------------------
+# ============================================================
+# 5. Mutation
+# ============================================================
 
-def discover(dataset, target, generations=300):
+def mutate(expression):
+
+    # Occasionally completely replace it
+    if random.random() < 0.15:
+
+        return random_expression()
+
+    # Leaf
+    if expression.is_leaf():
+
+        if random.random() < 0.5:
+
+            return random_leaf()
+
+        return expression
+
+    # Mutate left side
+    if random.random() < 0.5:
+
+        return Expression(
+            left=mutate(expression.left),
+            op=expression.op,
+            right=expression.right
+        )
+
+    # Mutate right side
+    return Expression(
+        left=expression.left,
+        op=expression.op,
+        right=mutate(expression.right)
+    )
+
+
+# ============================================================
+# 6. Evolutionary discovery
+# ============================================================
+
+def discover(
+    dataset,
+    target,
+    generations=300
+):
 
     population_size = 300
 
@@ -261,71 +349,99 @@ def discover(dataset, target, generations=300):
         for _ in range(population_size)
     ]
 
-    best = None
+    best_expression = None
     best_score = float("inf")
 
     for generation in range(generations):
 
         scored = []
 
-        for expr in population:
+        for expression in population:
 
             score = score_expression(
-                expr,
+                expression,
                 dataset,
                 target
             )
 
-            scored.append((score, expr))
+            scored.append(
+                (score, expression)
+            )
 
+            # New best
             if score < best_score:
 
                 best_score = score
-                best = expr
+                best_expression = expression
 
-        scored.sort(key=lambda x: x[0])
+        # Sort best → worst
+        scored.sort(
+            key=lambda item: item[0]
+        )
 
-        # Keep best 10%
+        # Keep the best 10%
         survivors = [
-            expr
-            for _, expr in scored[:30]
+            expression
+            for _, expression
+            in scored[:30]
         ]
 
-        # Print progress
+        # Progress
         if generation % 25 == 0:
 
             print(
                 f"Generation {generation:3} | "
                 f"error = {best_score:.8f} | "
-                f"{best}"
+                f"{best_expression}"
             )
 
-        # Create next generation
+        # New population
         population = survivors.copy()
 
         while len(population) < population_size:
 
-            parent = random.choice(survivors)
+            parent = random.choice(
+                survivors
+            )
 
             child = mutate(parent)
 
             population.append(child)
 
-    return best, best_score
+    return (
+        best_expression,
+        best_score
+    )
 
 
-# ------------------------------------------------------------
-# 7. Main
-# ------------------------------------------------------------
+# ============================================================
+# 7. Main program
+# ============================================================
 
 def main():
 
     data = make_data()
 
     experiments = [
-        ("F = ?", data["F_ma"], "F"),
-        ("v = ?", data["v_at"], "v"),
-        ("x = ?", data["x_at"], "x")
+
+        (
+            "F = ?",
+            data["F_ma"],
+            "F"
+        ),
+
+        (
+            "v = ?",
+            data["v_at"],
+            "v"
+        ),
+
+        (
+            "x = ?",
+            data["x_at"],
+            "x"
+        )
+
     ]
 
     print()
@@ -338,7 +454,9 @@ def main():
 
         print()
         print("-" * 60)
-        print(f"Searching for: {name}")
+        print(
+            f"Searching for: {name}"
+        )
         print("-" * 60)
 
         result, score = discover(
@@ -348,15 +466,23 @@ def main():
 
         print()
         print("DISCOVERED:")
-        print(f"    {target} = {result}")
+        print(
+            f"    {target} = {result}"
+        )
 
-        print(f"ERROR: {score:.10f}")
+        print(
+            f"ERROR: {score:.10f}"
+        )
 
     print()
     print("=" * 60)
     print("Search complete.")
     print("=" * 60)
 
+
+# ============================================================
+# Start
+# ============================================================
 
 if __name__ == "__main__":
     main()
