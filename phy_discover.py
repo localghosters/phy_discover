@@ -97,44 +97,44 @@ class Expression:
         return self.value is not None
 
 
-def evaluate(self, variables):
+    def evaluate(self, variables):
 
-    if self.is_leaf():
+        if self.is_leaf():
 
-        if isinstance(self.value, str):
-            return variables.get(self.value)
+            if isinstance(self.value, str):
+                return variables.get(self.value)
 
-        return self.value
+            return self.value
 
-    left = self.left.evaluate(variables)
-    right = self.right.evaluate(variables)
+        left = self.left.evaluate(variables)
+        right = self.right.evaluate(variables)
 
-    # Invalid variable/expression
-    if left is None or right is None:
+        # Invalid variable/expression
+        if left is None or right is None:
+            return None
+
+        try:
+
+            if self.op == "+":
+                return left + right
+
+            if self.op == "-":
+                return left - right
+
+            if self.op == "*":
+                return left * right
+
+            if self.op == "/":
+
+                if abs(right) < 1e-10:
+                    return None
+
+                return left / right
+
+        except (ValueError, ZeroDivisionError, OverflowError):
+            return None
+
         return None
-
-    try:
-
-        if self.op == "+":
-            return left + right
-
-        if self.op == "-":
-            return left - right
-
-        if self.op == "*":
-            return left * right
-
-        if self.op == "/":
-
-            if abs(right) < 1e-10:
-                return None
-
-            return left / right
-
-    except (ValueError, ZeroDivisionError, OverflowError):
-        return None
-
-    return None
 
 
     
