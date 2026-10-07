@@ -96,39 +96,48 @@ class Expression:
     def is_leaf(self):
         return self.value is not None
 
-    def evaluate(self, variables):
 
-        if self.is_leaf():
+def evaluate(self, variables):
 
-            if isinstance(self.value, str):
-                return variables[self.value]
+    if self.is_leaf():
 
-            return self.value
+        if isinstance(self.value, str):
+            return variables.get(self.value)
 
-        left = self.left.evaluate(variables)
-        right = self.right.evaluate(variables)
+        return self.value
 
-        try:
+    left = self.left.evaluate(variables)
+    right = self.right.evaluate(variables)
 
-            if self.op == "+":
-                return left + right
+    # Invalid variable/expression
+    if left is None or right is None:
+        return None
 
-            if self.op == "-":
-                return left - right
+    try:
 
-            if self.op == "*":
-                return left * right
+        if self.op == "+":
+            return left + right
 
-            if self.op == "/":
+        if self.op == "-":
+            return left - right
 
-                if abs(right) < 1e-10:
-                    return None
+        if self.op == "*":
+            return left * right
 
-                return left / right
+        if self.op == "/":
 
-        except:
-            return None
+            if abs(right) < 1e-10:
+                return None
 
+            return left / right
+
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+    return None
+
+
+    
     def __str__(self):
 
         if self.is_leaf():
