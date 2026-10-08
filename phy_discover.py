@@ -1,145 +1,192 @@
 import random
 import math
 import copy
+from collections import defaultdict
 
 # ============================================================
-# PHYDISCOVER V2.1
-# FIXED VERSION
+# PHYDISCOVER V3
+#
+# OPEN-ENDED LEVEL-1 MATHEMATICAL DISCOVERY ENGINE
+#
+# Goal:
+#   Discover relationships in raw data without being given
+#   target equations.
+#
+# The engine searches for:
+#
+#   y = f(x1, x2, ...)
+#
+# and invariant relationships:
+#
+#   f(x1, x2, ...) = constant
+#
+# It rewards:
+#   - accuracy
+#   - simplicity
+#   - generalization
+#   - dimensional consistency when dimensions are supplied
+#   - novelty
+#
+# It does NOT receive target formulas.
 # ============================================================
 
 random.seed(42)
 
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+POPULATION_SIZE = 700
+GENERATIONS = 700
+
+INITIAL_DEPTH = 4
+MAX_TREE_SIZE = 31
+MAX_TREE_DEPTH = 10
+
+ELITE_COUNT = 35
+TOURNAMENT_SIZE = 7
+
+MUTATION_RATE = 0.40
+CROSSOVER_RATE = 0.45
+
+ARCHIVE_LIMIT = 100
+
+MAX_ABS_VALUE = 1e12
+MAX_EXP_INPUT = 20
+MAX_POWER_EXPONENT = 8
+
+DISCOVERY_ERROR_THRESHOLD = 1e-4
 
 # ============================================================
-# 1. DATA
+# 2. DATASET
 # ============================================================
 
-def make_data():
+class Dataset:
 
-    data = {
-        "F_ma": [],
-        "v_at": [],
-        "x_at": [],
-        "p_mv": [],
-        "E_mgh": [],
-        "KE": []
+    def __init__(self, rows, name="experiment", dimensions=None):
+
+        self.rows = rows
+        self.name = name
+
+        self.variables = sorted(
+            set().union(
+                *(row.keys() for row in rows)
+            )
+        )
+
+        self.dimensions = dimensions or {}
+
+    def split(self, ratio=0.8):
+
+        shuffled = self.rows.copy()
+
+        random.shuffle(shuffled)
+
+        cut = int(len(shuffled) * ratio)
+
+        return (
+            Dataset(
+                shuffled[:cut],
+                self.name + "_train",
+                self.dimensions
+            ),
+            Dataset(
+                shuffled[cut:],
+                self.name + "_test",
+                self.dimensions
+            )
+        )
+
+# ============================================================
+# 3. EXPERIMENTAL DATA
+#
+# IMPORTANT:
+# These hidden relationships are NOT supplied to the discovery
+# algorithm as targets.
+#
+# The discoverer only sees the generated observations.
+# ============================================================
+
+def make_experimental_data():
+
+    rows = []
+
+    for _ in range(700):
+
+        x = random.uniform(0.5, 20.0)
+        y = random.uniform(0.5, 15.0)
+        z = random.uniform(0.5, 10.0)
+
+        # Hidden mathematical relationships.
+
+        a = 2.75 * x * y
+
+        b = 0.5 * x * y ** 2
+
+        c = 3.0 * math.sqrt(x) * z
+
+        d = 4.2 * x ** 2 / y
+
+        e = 1.7 * x * y + 2.0 * z
+
+        # Independent noisy measurement channels.
+
+        noise_a = random.gauss(
+            0,
+            abs(a) * 0.002
+        )
+
+        noise_b = random.gauss(
+            0,
+            abs(b) * 0.002
+        )
+
+        noise_c = random.gauss(
+            0,
+            abs(c) * 0.002
+        )
+
+        noise_d = random.gauss(
+            0,
+            abs(d) * 0.002
+        )
+
+        noise_e = random.gauss(
+            0,
+            abs(e) * 0.002
+        )
+
+        rows.append({
+            "x": x,
+            "y": y,
+            "z": z,
+
+            "A": a + noise_a,
+            "B": b + noise_b,
+            "C": c + noise_c,
+            "D": d + noise_d,
+            "E": e + noise_e
+        })
+
+    dimensions = {
+        "x": "X",
+        "y": "Y",
+        "z": "Z",
+        "A": "A",
+        "B": "B",
+        "C": "C",
+        "D": "D",
+        "E": "E"
     }
 
-    # --------------------------------------------------------
-    # Newton:
-    # F = ma
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        m = random.uniform(1, 10)
-        a = random.uniform(0.5, 10)
-
-        F = m * a
-
-        data["F_ma"].append({
-            "m": m,
-            "a": a,
-            "F": F
-        })
-
-    # --------------------------------------------------------
-    # Kinematics:
-    # v = at
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        a = random.uniform(0.5, 10)
-        t = random.uniform(0.1, 10)
-
-        v = a * t
-
-        data["v_at"].append({
-            "a": a,
-            "t": t,
-            "v": v
-        })
-
-    # --------------------------------------------------------
-    # Kinematics:
-    # x = 1/2 at²
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        a = random.uniform(0.5, 10)
-        t = random.uniform(0.1, 10)
-
-        x = 0.5 * a * t ** 2
-
-        data["x_at"].append({
-            "a": a,
-            "t": t,
-            "x": x
-        })
-
-    # --------------------------------------------------------
-    # Momentum:
-    # p = mv
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        m = random.uniform(1, 10)
-        v = random.uniform(0.5, 20)
-
-        p = m * v
-
-        data["p_mv"].append({
-            "m": m,
-            "v": v,
-            "p": p
-        })
-
-    # --------------------------------------------------------
-    # Potential energy:
-    # E = mgh
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        m = random.uniform(1, 10)
-        g = 9.8
-        h = random.uniform(0.1, 20)
-
-        E = m * g * h
-
-        data["E_mgh"].append({
-            "m": m,
-            "g": g,
-            "h": h,
-            "E": E
-        })
-
-    # --------------------------------------------------------
-    # Kinetic energy:
-    # KE = 1/2 mv²
-    # --------------------------------------------------------
-
-    for _ in range(100):
-
-        m = random.uniform(1, 10)
-        v = random.uniform(0.5, 20)
-
-        KE = 0.5 * m * v ** 2
-
-        data["KE"].append({
-            "m": m,
-            "v": v,
-            "KE": KE
-        })
-
-    return data
-
+    return Dataset(
+        rows,
+        "hidden_relationship_experiment",
+        dimensions
+    )
 
 # ============================================================
-# 2. NODE
+# 4. NODE
 # ============================================================
 
 class Node:
@@ -147,11 +194,20 @@ class Node:
     UNARY_OPS = {
         "sin",
         "cos",
-        "exp",
-        "log",
         "sqrt",
+        "log",
         "abs",
-        "neg"
+        "neg",
+        "exp",
+        "inv"
+    }
+
+    BINARY_OPS = {
+        "+",
+        "-",
+        "*",
+        "/",
+        "^"
     }
 
     def __init__(
@@ -167,25 +223,13 @@ class Node:
         self.left = left
         self.right = right
 
-    # --------------------------------------------------------
-    # Leaf?
-    # --------------------------------------------------------
-
     def is_leaf(self):
 
         return self.op is None
 
-    # --------------------------------------------------------
-    # Deep copy
-    # --------------------------------------------------------
-
     def clone(self):
 
         return copy.deepcopy(self)
-
-    # --------------------------------------------------------
-    # Evaluate
-    # --------------------------------------------------------
 
     def evaluate(self, variables):
 
@@ -193,22 +237,22 @@ class Node:
 
             if isinstance(self.value, str):
 
-                return variables.get(self.value)
+                return variables.get(
+                    self.value
+                )
 
             return self.value
 
         try:
-
-            # ------------------------------------------------
-            # Unary operation
-            # ------------------------------------------------
 
             if self.op in Node.UNARY_OPS:
 
                 if self.left is None:
                     return None
 
-                x = self.left.evaluate(variables)
+                x = self.left.evaluate(
+                    variables
+                )
 
                 if x is None:
                     return None
@@ -216,48 +260,77 @@ class Node:
                 if not math.isfinite(x):
                     return None
 
+                if abs(x) > MAX_ABS_VALUE:
+                    return None
+
                 if self.op == "sin":
-                    return math.sin(x)
+                    result = math.sin(x)
 
-                if self.op == "cos":
-                    return math.cos(x)
+                elif self.op == "cos":
+                    result = math.cos(x)
 
-                if self.op == "exp":
-
-                    if x > 50 or x < -50:
-                        return None
-
-                    return math.exp(x)
-
-                if self.op == "log":
-
-                    if x <= 0:
-                        return None
-
-                    return math.log(x)
-
-                if self.op == "sqrt":
+                elif self.op == "sqrt":
 
                     if x < 0:
                         return None
 
-                    return math.sqrt(x)
+                    result = math.sqrt(x)
 
-                if self.op == "abs":
-                    return abs(x)
+                elif self.op == "log":
 
-                if self.op == "neg":
-                    return -x
+                    if x <= 0:
+                        return None
 
-            # ------------------------------------------------
-            # Binary operation
-            # ------------------------------------------------
+                    result = math.log(x)
 
-            if self.left is None or self.right is None:
+                elif self.op == "abs":
+
+                    result = abs(x)
+
+                elif self.op == "neg":
+
+                    result = -x
+
+                elif self.op == "inv":
+
+                    if abs(x) < 1e-12:
+                        return None
+
+                    result = 1.0 / x
+
+                elif self.op == "exp":
+
+                    if x < -MAX_EXP_INPUT:
+                        result = 0.0
+
+                    elif x > MAX_EXP_INPUT:
+                        return None
+
+                    else:
+                        result = math.exp(x)
+
+                else:
+
+                    return None
+
+                if not math.isfinite(result):
+                    return None
+
+                return result
+
+            if self.left is None:
                 return None
 
-            left = self.left.evaluate(variables)
-            right = self.right.evaluate(variables)
+            if self.right is None:
+                return None
+
+            left = self.left.evaluate(
+                variables
+            )
+
+            right = self.right.evaluate(
+                variables
+            )
 
             if left is None or right is None:
                 return None
@@ -266,6 +339,12 @@ class Node:
                 return None
 
             if not math.isfinite(right):
+                return None
+
+            if abs(left) > MAX_ABS_VALUE:
+                return None
+
+            if abs(right) > MAX_ABS_VALUE:
                 return None
 
             if self.op == "+":
@@ -289,17 +368,17 @@ class Node:
 
             elif self.op == "^":
 
-                # Avoid explosive expressions
-                if abs(left) > 1e6:
+                if abs(right) > MAX_POWER_EXPONENT:
                     return None
 
-                if abs(right) > 10:
+                if left == 0 and right < 0:
                     return None
 
-                # Negative number to non-integer power
                 if (
                     left < 0
-                    and abs(right - round(right)) > 1e-10
+                    and abs(
+                        right - round(right)
+                    ) > 1e-10
                 ):
                     return None
 
@@ -312,6 +391,9 @@ class Node:
             if not math.isfinite(result):
                 return None
 
+            if abs(result) > MAX_ABS_VALUE:
+                return None
+
             return result
 
         except (
@@ -322,49 +404,6 @@ class Node:
 
             return None
 
-    # --------------------------------------------------------
-    # String representation
-    # --------------------------------------------------------
-
-    def __str__(self):
-
-        if self.is_leaf():
-
-            if isinstance(self.value, float):
-
-                return f"{self.value:.6g}"
-
-            return str(self.value)
-
-        if self.op in Node.UNARY_OPS:
-
-            if self.left is None:
-                return f"{self.op}(?)"
-
-            return f"{self.op}({self.left})"
-
-        left_string = (
-            str(self.left)
-            if self.left is not None
-            else "?"
-        )
-
-        right_string = (
-            str(self.right)
-            if self.right is not None
-            else "?"
-        )
-
-        return (
-            f"({left_string} "
-            f"{self.op} "
-            f"{right_string})"
-        )
-
-    # --------------------------------------------------------
-    # Structural size
-    # --------------------------------------------------------
-
     def size(self):
 
         if self.is_leaf():
@@ -372,28 +411,28 @@ class Node:
 
         if self.op in Node.UNARY_OPS:
 
-            if self.left is None:
-                return 1
+            return (
+                1
+                + (
+                    self.left.size()
+                    if self.left is not None
+                    else 0
+                )
+            )
 
-            return 1 + self.left.size()
-
-        left_size = (
-            self.left.size()
-            if self.left is not None
-            else 0
+        return (
+            1
+            + (
+                self.left.size()
+                if self.left is not None
+                else 0
+            )
+            + (
+                self.right.size()
+                if self.right is not None
+                else 0
+            )
         )
-
-        right_size = (
-            self.right.size()
-            if self.right is not None
-            else 0
-        )
-
-        return 1 + left_size + right_size
-
-    # --------------------------------------------------------
-    # Maximum depth
-    # --------------------------------------------------------
 
     def depth(self):
 
@@ -402,52 +441,122 @@ class Node:
 
         if self.op in Node.UNARY_OPS:
 
-            if self.left is None:
-                return 1
+            return (
+                1
+                + (
+                    self.left.depth()
+                    if self.left is not None
+                    else 0
+                )
+            )
 
-            return 1 + self.left.depth()
+        return (
+            1
+            + max(
+                self.left.depth()
+                if self.left is not None
+                else 0,
 
-        left_depth = (
-            self.left.depth()
+                self.right.depth()
+                if self.right is not None
+                else 0
+            )
+        )
+
+    def variables_used(self):
+
+        if self.is_leaf():
+
+            if isinstance(self.value, str):
+                return {self.value}
+
+            return set()
+
+        result = set()
+
+        if self.left is not None:
+            result.update(
+                self.left.variables_used()
+            )
+
+        if self.right is not None:
+            result.update(
+                self.right.variables_used()
+            )
+
+        return result
+
+    def __str__(self):
+
+        if self.is_leaf():
+
+            if isinstance(self.value, float):
+
+                if abs(
+                    self.value
+                    - round(self.value)
+                ) < 1e-10:
+
+                    return str(
+                        int(round(self.value))
+                    )
+
+                return f"{self.value:.6g}"
+
+            return str(self.value)
+
+        if self.op in Node.UNARY_OPS:
+
+            child = (
+                str(self.left)
+                if self.left is not None
+                else "?"
+            )
+
+            if self.op == "neg":
+                return f"-({child})"
+
+            if self.op == "inv":
+                return f"1/({child})"
+
+            return f"{self.op}({child})"
+
+        left = (
+            str(self.left)
             if self.left is not None
-            else 0
+            else "?"
         )
 
-        right_depth = (
-            self.right.depth()
+        right = (
+            str(self.right)
             if self.right is not None
-            else 0
+            else "?"
         )
 
-        return 1 + max(
-            left_depth,
-            right_depth
+        return (
+            f"({left} {self.op} {right})"
         )
-
 
 # ============================================================
-# 3. SELF-GROWING GRAMMAR
+# 5. GRAMMAR
 # ============================================================
 
 class Grammar:
 
-    def __init__(self):
+    def __init__(self, variables):
 
-        self.variables = set([
-            "m",
-            "a",
-            "t",
-            "v",
-            "g",
-            "h"
-        ])
+        self.variables = list(
+            variables
+        )
 
         self.constants = [
+            0.25,
             0.5,
             1.0,
             2.0,
             3.0,
-            9.8
+            4.0,
+            5.0
         ]
 
         self.binary_ops = [
@@ -460,99 +569,96 @@ class Grammar:
         self.unary_ops = []
 
         self.powers = [
-            2.0
+            -2.0,
+            -1.0,
+            0.5,
+            1.0,
+            2.0,
+            3.0
         ]
 
-        self.growth_level = 0
-
-    # --------------------------------------------------------
-    # Grow grammar
-    # --------------------------------------------------------
+        self.level = 0
 
     def grow(self):
 
-        self.growth_level += 1
+        self.level += 1
 
-        if self.growth_level == 1:
+        if self.level == 1:
 
-            if "^" not in self.binary_ops:
+            self.binary_ops.append("^")
 
-                self.binary_ops.append("^")
+        elif self.level == 2:
 
-            self.powers.extend([
-                0.5,
-                3.0
-            ])
-
-        elif self.growth_level == 2:
-
-            for op in [
+            self.unary_ops.extend([
                 "sqrt",
                 "abs",
-                "neg"
-            ]:
+                "neg",
+                "inv"
+            ])
 
-                if op not in self.unary_ops:
+        elif self.level == 3:
 
-                    self.unary_ops.append(op)
-
-        elif self.growth_level == 3:
-
-            for op in [
+            self.unary_ops.extend([
                 "log",
                 "exp"
-            ]:
+            ])
 
-                if op not in self.unary_ops:
+        elif self.level == 4:
 
-                    self.unary_ops.append(op)
-
-        elif self.growth_level == 4:
-
-            for op in [
+            self.unary_ops.extend([
                 "sin",
                 "cos"
-            ]:
+            ])
 
-                if op not in self.unary_ops:
+        elif self.level >= 5:
 
-                    self.unary_ops.append(op)
-
-        elif self.growth_level >= 5:
-
-            candidates = [
-                0.25,
-                0.3333333333,
-                4.0,
-                6.28,
+            self.constants.extend([
+                0.1,
+                0.2,
+                0.333333333333,
+                0.666666666667,
+                1.5,
+                2.5,
+                3.5,
+                math.pi,
+                9.8,
                 9.81
-            ]
+            ])
 
-            for c in candidates:
-
-                if c not in self.constants:
-
-                    self.constants.append(c)
-
-        print(
-            f"\n*** GRAMMAR GROWN TO LEVEL "
-            f"{self.growth_level} ***"
+        self.unary_ops = list(
+            dict.fromkeys(
+                self.unary_ops
+            )
         )
 
+        self.binary_ops = list(
+            dict.fromkeys(
+                self.binary_ops
+            )
+        )
+
+        self.constants = list(
+            dict.fromkeys(
+                self.constants
+            )
+        )
+
+        print(
+            f"\n[GRAMMAR] Growth level "
+            f"{self.level}"
+        )
 
 # ============================================================
-# 4. RANDOM NODE GENERATION
+# 6. RANDOM TREE GENERATION
 # ============================================================
 
 def random_leaf(grammar):
 
-    r = random.random()
-
-    if r < 0.65:
+    if random.random() < 0.78:
 
         return Node(
             value=random.choice(
-                list(grammar.variables)
+                grammar.variables
             )
         )
 
@@ -562,27 +668,23 @@ def random_leaf(grammar):
         )
     )
 
-
 def random_expression(
     grammar,
     depth=0,
-    max_depth=4
+    max_depth=INITIAL_DEPTH
 ):
 
-    # Stop recursion
     if depth >= max_depth:
 
         return random_leaf(grammar)
 
-    # Leaf probability
     if random.random() < 0.30:
 
         return random_leaf(grammar)
 
-    # Unary operation
     if (
         grammar.unary_ops
-        and random.random() < 0.15
+        and random.random() < 0.18
     ):
 
         return Node(
@@ -596,7 +698,6 @@ def random_expression(
             )
         )
 
-    # Binary
     left = random_expression(
         grammar,
         depth + 1,
@@ -613,7 +714,6 @@ def random_expression(
         grammar.binary_ops
     )
 
-    # Power uses a known numerical exponent
     if op == "^":
 
         right = Node(
@@ -628,80 +728,82 @@ def random_expression(
         right=right
     )
 
-
 # ============================================================
-# 5. RANDOM CONSTANT LEARNING
+# 7. CONSTANT MUTATION
 # ============================================================
 
-def random_constant():
+def random_discovered_constant():
 
     candidates = [
+        0.05,
         0.1,
+        0.2,
         0.25,
-        0.333333,
+        0.333333333,
         0.5,
-        0.666666,
-        1,
-        2,
-        3,
-        4,
-        5,
+        0.666666667,
+        0.75,
+        1.0,
+        1.5,
+        2.0,
+        2.5,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
         9.8,
         9.81,
         math.pi
     ]
 
-    return random.choice(candidates)
+    return random.choice(
+        candidates
+    )
 
-
-# ============================================================
-# 6. CONSTANT MUTATION
-# ============================================================
-
-def mutate_constant(node):
+def mutate_leaf(node):
 
     if node is None:
-        return Node(value=random_constant())
+
+        return None
 
     if not node.is_leaf():
+
         return node.clone()
 
     if isinstance(node.value, str):
+
+        if random.random() < 0.15:
+
+            return Node(
+                value=random_discovered_constant()
+            )
+
         return node.clone()
 
     if random.random() < 0.5:
 
         scale = random.uniform(
-            0.8,
-            1.2
-        )
-
-        new_value = (
-            node.value * scale
+            0.7,
+            1.3
         )
 
         return Node(
-            value=new_value
+            value=node.value * scale
         )
 
     return Node(
-        value=random_constant()
+        value=random_discovered_constant()
     )
 
-
 # ============================================================
-# 7. MUTATION
+# 8. MUTATION
 # ============================================================
 
 def mutate(
     node,
     grammar,
-    probability=0.20
+    probability=MUTATION_RATE
 ):
-
-    # --------------------------------------------------------
-    # Safety against None
-    # --------------------------------------------------------
 
     if node is None:
 
@@ -714,28 +816,76 @@ def mutate(
 
         return node.clone()
 
-    # --------------------------------------------------------
-    # Completely replace subtree
-    # --------------------------------------------------------
+    # Whole-subtree replacement.
 
-    if random.random() < 0.12:
+    if random.random() < 0.13:
 
         return random_expression(
             grammar,
-            max_depth=3
+            max_depth=random.randint(
+                2,
+                4
+            )
         )
 
-    # --------------------------------------------------------
-    # Leaf mutation
-    # --------------------------------------------------------
+    # Leaf.
 
     if node.is_leaf():
 
-        return mutate_constant(node)
+        return mutate_leaf(node)
 
-    # --------------------------------------------------------
-    # Unary
-    # --------------------------------------------------------
+    # Change operator.
+
+    if random.random() < 0.18:
+
+        if node.op in Node.UNARY_OPS:
+
+            if grammar.unary_ops:
+
+                return Node(
+                    op=random.choice(
+                        grammar.unary_ops
+                    ),
+                    left=(
+                        node.left.clone()
+                        if node.left is not None
+                        else random_leaf(grammar)
+                    )
+                )
+
+        else:
+
+            new_op = random.choice(
+                grammar.binary_ops
+            )
+
+            left = (
+                node.left.clone()
+                if node.left is not None
+                else random_leaf(grammar)
+            )
+
+            right = (
+                node.right.clone()
+                if node.right is not None
+                else random_leaf(grammar)
+            )
+
+            if new_op == "^":
+
+                right = Node(
+                    value=random.choice(
+                        grammar.powers
+                    )
+                )
+
+            return Node(
+                op=new_op,
+                left=left,
+                right=right
+            )
+
+    # Unary mutation.
 
     if node.op in Node.UNARY_OPS:
 
@@ -748,45 +898,7 @@ def mutate(
             )
         )
 
-    # --------------------------------------------------------
-    # Binary
-    # --------------------------------------------------------
-
-    if random.random() < 0.20:
-
-        new_op = random.choice(
-            grammar.binary_ops
-        )
-
-        left = (
-            node.left.clone()
-            if node.left is not None
-            else random_leaf(grammar)
-        )
-
-        right = (
-            node.right.clone()
-            if node.right is not None
-            else random_leaf(grammar)
-        )
-
-        if new_op == "^":
-
-            right = Node(
-                value=random.choice(
-                    grammar.powers
-                )
-            )
-
-        return Node(
-            op=new_op,
-            left=left,
-            right=right
-        )
-
-    # --------------------------------------------------------
-    # Mutate left
-    # --------------------------------------------------------
+    # Binary mutation.
 
     if random.random() < 0.5:
 
@@ -802,27 +914,19 @@ def mutate(
             else random_leaf(grammar)
         )
 
-        return Node(
-            op=node.op,
-            left=left,
-            right=right
+    else:
+
+        left = (
+            node.left.clone()
+            if node.left is not None
+            else random_leaf(grammar)
         )
 
-    # --------------------------------------------------------
-    # Mutate right
-    # --------------------------------------------------------
-
-    left = (
-        node.left.clone()
-        if node.left is not None
-        else random_leaf(grammar)
-    )
-
-    right = mutate(
-        node.right,
-        grammar,
-        probability
-    )
+        right = mutate(
+            node.right,
+            grammar,
+            probability
+        )
 
     return Node(
         op=node.op,
@@ -830,42 +934,27 @@ def mutate(
         right=right
     )
 
-
 # ============================================================
-# 8. CROSSOVER
+# 9. CROSSOVER
 # ============================================================
 
 def crossover(a, b):
-
-    # ========================================================
-    # IMPORTANT FIX
-    #
-    # The old version assumed that a and b were always Node
-    # objects. Some recursive paths could pass None.
-    #
-    # We now explicitly handle None.
-    # ========================================================
 
     if a is None and b is None:
         return None
 
     if a is None:
-        return b.clone() if b is not None else None
+        return b.clone()
 
     if b is None:
         return a.clone()
 
-    # --------------------------------------------------------
-    # Occasionally simply clone
-    # --------------------------------------------------------
+    if random.random() < 0.08:
 
-    if random.random() < 0.10:
-
-        return a.clone()
-
-    # --------------------------------------------------------
-    # If either is a leaf, safely exchange subtree
-    # --------------------------------------------------------
+        return random.choice([
+            a.clone(),
+            b.clone()
+        ])
 
     if a.is_leaf():
 
@@ -875,24 +964,25 @@ def crossover(a, b):
 
         return a.clone()
 
-    # --------------------------------------------------------
-    # Unary node
-    # --------------------------------------------------------
+    # Unary / unary.
+
+    if (
+        a.op in Node.UNARY_OPS
+        and b.op in Node.UNARY_OPS
+    ):
+
+        return Node(
+            op=a.op,
+            left=crossover(
+                a.left,
+                b.left
+            )
+        )
+
+    # Unary A / binary B.
 
     if a.op in Node.UNARY_OPS:
 
-        # If B is unary, crossover its child.
-        if b.op in Node.UNARY_OPS:
-
-            return Node(
-                op=a.op,
-                left=crossover(
-                    a.left,
-                    b.left
-                )
-            )
-
-        # Otherwise use B as possible subtree.
         if random.random() < 0.5:
 
             return Node(
@@ -905,9 +995,7 @@ def crossover(a, b):
 
         return a.clone()
 
-    # --------------------------------------------------------
-    # If A is binary but B is unary
-    # --------------------------------------------------------
+    # Binary A / unary B.
 
     if b.op in Node.UNARY_OPS:
 
@@ -939,64 +1027,59 @@ def crossover(a, b):
             )
         )
 
-    # --------------------------------------------------------
-    # Normal binary crossover
-    # --------------------------------------------------------
+    # Binary / binary.
 
     if random.random() < 0.5:
 
-        new_left = crossover(
-            a.left,
-            b.left
-        )
-
-        new_right = (
-            a.right.clone()
-            if a.right is not None
-            else (
-                b.right.clone()
-                if b.right is not None
+        return Node(
+            op=a.op,
+            left=crossover(
+                a.left,
+                b.left
+            ),
+            right=(
+                a.right.clone()
+                if a.right is not None
                 else None
             )
         )
 
-        return Node(
-            op=a.op,
-            left=new_left,
-            right=new_right
-        )
-
-    new_left = (
-        a.left.clone()
-        if a.left is not None
-        else (
-            b.left.clone()
-            if b.left is not None
-            else None
-        )
-    )
-
-    new_right = crossover(
-        a.right,
-        b.right
-    )
-
     return Node(
         op=a.op,
-        left=new_left,
-        right=new_right
+        left=(
+            a.left.clone()
+            if a.left is not None
+            else None
+        ),
+        right=crossover(
+            a.right,
+            b.right
+        )
     )
 
+# ============================================================
+# 10. SIMPLIFICATION
+# ============================================================
 
-# ============================================================
-# 9. SIMPLIFICATION
-# ============================================================
+def is_constant(node, value=None):
+
+    if node is None:
+        return False
+
+    if not node.is_leaf():
+        return False
+
+    if isinstance(node.value, str):
+        return False
+
+    if value is None:
+        return True
+
+    return abs(
+        node.value - value
+    ) < 1e-12
 
 def simplify(node):
-
-    # --------------------------------------------------------
-    # None protection
-    # --------------------------------------------------------
 
     if node is None:
 
@@ -1006,15 +1089,14 @@ def simplify(node):
 
         return node.clone()
 
-    # --------------------------------------------------------
-    # Unary
-    # --------------------------------------------------------
-
     if node.op in Node.UNARY_OPS:
 
-        child = simplify(node.left)
+        child = simplify(
+            node.left
+        )
 
-        # -(-x) = x
+        # --x = x
+
         if (
             node.op == "neg"
             and not child.is_leaf()
@@ -1025,110 +1107,129 @@ def simplify(node):
                 child.left
             )
 
+        # abs(abs(x)) = abs(x)
+
+        if (
+            node.op == "abs"
+            and not child.is_leaf()
+            and child.op == "abs"
+        ):
+
+            return child
+
         return Node(
             op=node.op,
             left=child
         )
 
-    # --------------------------------------------------------
-    # Binary
-    # --------------------------------------------------------
+    left = simplify(
+        node.left
+    )
 
-    left = simplify(node.left)
-    right = simplify(node.right)
-
-    # --------------------------------------------------------
-    # Algebraic identities
-    # --------------------------------------------------------
+    right = simplify(
+        node.right
+    )
 
     # x + 0
-    if (
-        node.op == "+"
-        and right.is_leaf()
-        and right.value == 0
-    ):
 
+    if node.op == "+" and is_constant(
+        right,
+        0
+    ):
         return left
 
     # 0 + x
-    if (
-        node.op == "+"
-        and left.is_leaf()
-        and left.value == 0
-    ):
 
+    if node.op == "+" and is_constant(
+        left,
+        0
+    ):
         return right
 
     # x - 0
-    if (
-        node.op == "-"
-        and right.is_leaf()
-        and right.value == 0
-    ):
 
+    if node.op == "-" and is_constant(
+        right,
+        0
+    ):
         return left
 
     # x * 1
-    if (
-        node.op == "*"
-        and right.is_leaf()
-        and right.value == 1
-    ):
 
+    if node.op == "*" and is_constant(
+        right,
+        1
+    ):
         return left
 
     # 1 * x
-    if (
-        node.op == "*"
-        and left.is_leaf()
-        and left.value == 1
-    ):
 
+    if node.op == "*" and is_constant(
+        left,
+        1
+    ):
         return right
 
-    # x / 1
-    if (
-        node.op == "/"
-        and right.is_leaf()
-        and right.value == 1
-    ):
-
-        return left
-
     # x * 0
+
     if node.op == "*":
 
-        if (
-            left.is_leaf()
-            and left.value == 0
-        ):
-
+        if is_constant(left, 0):
             return Node(value=0)
 
-        if (
-            right.is_leaf()
-            and right.value == 0
-        ):
-
+        if is_constant(right, 0):
             return Node(value=0)
 
-    # x ^ 1
-    if (
-        node.op == "^"
-        and right.is_leaf()
-        and right.value == 1
+    # x / 1
+
+    if node.op == "/" and is_constant(
+        right,
+        1
     ):
-
         return left
 
-    # x ^ 0 = 1
+    # x ^ 1
+
+    if node.op == "^" and is_constant(
+        right,
+        1
+    ):
+        return left
+
+    # x ^ 0
+
+    if node.op == "^" and is_constant(
+        right,
+        0
+    ):
+        return Node(value=1)
+
+    # Constant folding.
+
     if (
-        node.op == "^"
+        left.is_leaf()
         and right.is_leaf()
-        and right.value == 0
+        and not isinstance(
+            left.value,
+            str
+        )
+        and not isinstance(
+            right.value,
+            str
+        )
     ):
 
-        return Node(value=1)
+        result = Node(
+            op=node.op,
+            left=left,
+            right=right
+        ).evaluate({})
+
+        if result is not None:
+
+            return Node(
+                value=result
+            )
 
     return Node(
         op=node.op,
@@ -1136,317 +1237,1018 @@ def simplify(node):
         right=right
     )
 
+# ============================================================
+# 11. CANONICALIZATION
+#
+# Used to identify equivalent expressions.
+# ============================================================
+
+def canonical(node):
+
+    if node is None:
+        return "?"
+
+    if node.is_leaf():
+
+        if isinstance(node.value, str):
+            return node.value
+
+        if abs(
+            node.value
+            - round(node.value)
+        ) < 1e-10:
+
+            return str(
+                int(round(node.value))
+            )
+
+        return f"{node.value:.8g}"
+
+    if node.op in Node.UNARY_OPS:
+
+        return (
+            f"{node.op}("
+            f"{canonical(node.left)})"
+        )
+
+    left = canonical(
+        node.left
+    )
+
+    right = canonical(
+        node.right
+    )
+
+    # Commutative operations.
+
+    if node.op in {
+        "+",
+        "*"
+    }:
+
+        children = sorted([
+            left,
+            right
+        ])
+
+        left = children[0]
+        right = children[1]
+
+    return (
+        f"({left}"
+        f"{node.op}"
+        f"{right})"
+    )
 
 # ============================================================
-# 10. SCORE
+# 12. NUMERICAL RELATION NORMALIZATION
 # ============================================================
 
-def score_expression(
+def robust_scale(values):
+
+    values = [
+        abs(x)
+        for x in values
+        if x is not None
+        and math.isfinite(x)
+    ]
+
+    if not values:
+        return 1.0
+
+    values.sort()
+
+    middle = values[
+        len(values) // 2
+    ]
+
+    return max(
+        middle,
+        1e-12
+    )
+
+# ============================================================
+# 13. RELATIONSHIP OBJECTIVE
+# ============================================================
+
+class Candidate:
+
+    def __init__(
+        self,
+        expression,
+        score,
+        error,
+        complexity,
+        coverage,
+        novelty,
+        kind,
+        target=None
+    ):
+
+        self.expression = expression
+        self.score = score
+        self.error = error
+        self.complexity = complexity
+        self.coverage = coverage
+        self.novelty = novelty
+        self.kind = kind
+        self.target = target
+
+    def __lt__(self, other):
+
+        return self.score < other.score
+
+# ============================================================
+# 14. PREDICTIVE FITNESS
+#
+# The expression predicts one measured variable.
+#
+# Example:
+#
+# A ≈ 2.75*x*y
+#
+# The system is NOT told this equation.
+# It only knows that A is a measured column and searches
+# expressions that predict it.
+# ============================================================
+
+def predictive_error(
     expression,
     dataset,
     target
 ):
 
-    if expression is None:
+    actuals = []
+    predictions = []
 
-        return float("inf")
+    for row in dataset.rows:
 
-    total_error = 0.0
-    valid = 0
+        actual = row.get(target)
 
-    for row in dataset:
+        if actual is None:
+            continue
 
-        try:
-
-            prediction = expression.evaluate(
-                row
-            )
-
-        except Exception:
-
-            prediction = None
+        prediction = expression.evaluate(
+            row
+        )
 
         if prediction is None:
             continue
 
-        if not math.isfinite(prediction):
+        if not math.isfinite(
+            prediction
+        ):
             continue
 
-        actual = row[target]
+        if abs(prediction) > MAX_ABS_VALUE:
+            continue
 
-        denominator = max(
-            abs(actual),
+        actuals.append(
+            actual
+        )
+
+        predictions.append(
+            prediction
+        )
+
+    if not actuals:
+
+        return (
+            float("inf"),
+            0.0
+        )
+
+    scale = robust_scale(
+        actuals
+    )
+
+    errors = []
+
+    for actual, prediction in zip(
+        actuals,
+        predictions
+    ):
+
+        error = (
+            abs(prediction - actual)
+            / max(
+                abs(actual),
+                scale * 1e-6,
+                1e-12
+            )
+        )
+
+        errors.append(error)
+
+    mean_error = (
+        sum(errors)
+        / len(errors)
+    )
+
+    coverage = (
+        len(actuals)
+        / len(dataset.rows)
+    )
+
+    return (
+        mean_error,
+        coverage
+    )
+
+# ============================================================
+# 15. CONSTANT-INVARIANT FITNESS
+#
+# Searches for expressions that remain approximately constant.
+#
+# Example:
+#
+# A / (x*y) ≈ 2.75
+#
+# This can reveal a relationship without requiring a
+# predetermined dependent variable.
+# ============================================================
+
+def invariant_error(
+    expression,
+    dataset
+):
+
+    values = []
+
+    for row in dataset.rows:
+
+        value = expression.evaluate(
+            row
+        )
+
+        if value is None:
+            continue
+
+        if not math.isfinite(value):
+            continue
+
+        if abs(value) > MAX_ABS_VALUE:
+            continue
+
+        values.append(value)
+
+    if len(values) < 10:
+
+        return (
+            float("inf"),
+            0.0,
+            None
+        )
+
+    center = (
+        sum(values)
+        / len(values)
+    )
+
+    absolute_deviations = [
+        abs(v - center)
+        for v in values
+    ]
+
+    scale = max(
+        abs(center),
+        robust_scale(values),
+        1e-12
+    )
+
+    error = (
+        sum(
+            absolute_deviations
+        )
+        / len(values)
+        / scale
+    )
+
+    coverage = (
+        len(values)
+        / len(dataset.rows)
+    )
+
+    return (
+        error,
+        coverage,
+        center
+    )
+
+# ============================================================
+# 16. NOVELTY
+# ============================================================
+
+def expression_similarity(
+    expression,
+    archive
+):
+
+    if not archive:
+
+        return 1.0
+
+    variables = expression.variables_used()
+
+    best_similarity = 0.0
+
+    for old in archive:
+
+        old_variables = (
+            old.variables_used()
+        )
+
+        intersection = len(
+            variables
+            & old_variables
+        )
+
+        union = len(
+            variables
+            | old_variables
+        )
+
+        if union == 0:
+
+            variable_similarity = 1.0
+
+        else:
+
+            variable_similarity = (
+                intersection
+                / union
+            )
+
+        size_difference = abs(
+            expression.size()
+            - old.size()
+        )
+
+        structural_similarity = (
+            1.0
+            / (
+                1.0
+                + size_difference
+            )
+        )
+
+        similarity = (
+            0.6
+            * variable_similarity
+            + 0.4
+            * structural_similarity
+        )
+
+        best_similarity = max(
+            best_similarity,
+            similarity
+        )
+
+    return max(
+        0.0,
+        1.0 - best_similarity
+    )
+
+# ============================================================
+# 17. SCORE PREDICTIVE CANDIDATE
+# ============================================================
+
+def score_predictive_candidate(
+    expression,
+    dataset,
+    target,
+    archive
+):
+
+    error, coverage = predictive_error(
+        expression,
+        dataset,
+        target
+    )
+
+    if not math.isfinite(error):
+
+        return Candidate(
+            expression,
+            float("inf"),
+            float("inf"),
+            expression.size(),
+            coverage,
+            0.0,
+            "predictive",
+            target
+        )
+
+    complexity = expression.size()
+
+    depth = expression.depth()
+
+    novelty = expression_novelty(
+        expression,
+        archive
+    )
+
+    complexity_penalty = (
+        0.0007 * complexity
+        + 0.0002 * depth
+    )
+
+    coverage_penalty = (
+        max(
+            0.0,
+            1.0 - coverage
+        )
+        * 2.0
+    )
+
+    novelty_bonus = (
+        0.03 * novelty
+    )
+
+    score = (
+        error
+        + complexity_penalty
+        + coverage_penalty
+        - novelty_bonus
+    )
+
+    return Candidate(
+        expression,
+        score,
+        error,
+        complexity,
+        coverage,
+        novelty,
+        "predictive",
+        target
+    )
+
+# ============================================================
+# 18. EXPRESSION NOVELTY
+# ============================================================
+
+def expression_novelty(
+    expression,
+    archive
+):
+
+    if not archive:
+        return 1.0
+
+    key = canonical(
+        expression
+    )
+
+    for old in archive:
+
+        if canonical(old) == key:
+
+            return 0.0
+
+    # Variable-level novelty.
+
+    used = expression.variables_used()
+
+    if not used:
+        return 0.1
+
+    maximum_overlap = 0.0
+
+    for old in archive:
+
+        old_used = (
+            old.variables_used()
+        )
+
+        if not old_used:
+            continue
+
+        overlap = len(
+            used & old_used
+        ) / len(
+            used | old_used
+        )
+
+        maximum_overlap = max(
+            maximum_overlap,
+            overlap
+        )
+
+    return max(
+        0.0,
+        1.0 - maximum_overlap * 0.7
+    )
+
+# ============================================================
+# 19. SCORE INVARIANT CANDIDATE
+# ============================================================
+
+def score_invariant_candidate(
+    expression,
+    dataset,
+    archive
+):
+
+    error, coverage, constant = (
+        invariant_error(
+            expression,
+            dataset
+        )
+    )
+
+    if not math.isfinite(error):
+
+        return Candidate(
+            expression,
+            float("inf"),
+            float("inf"),
+            expression.size(),
+            coverage,
+            0.0,
+            "invariant"
+        )
+
+    # Reject expressions that are simply constants.
+
+    if not expression.variables_used():
+
+        return Candidate(
+            expression,
+            float("inf"),
+            error,
+            expression.size(),
+            coverage,
+            0.0,
+            "invariant"
+        )
+
+    complexity = expression.size()
+
+    depth = expression.depth()
+
+    novelty = expression_novelty(
+        expression,
+        archive
+    )
+
+    score = (
+        error
+        + 0.0007 * complexity
+        + 0.0002 * depth
+        + max(
+            0.0,
+            1.0 - coverage
+        )
+        * 2.0
+        - 0.03 * novelty
+    )
+
+    return Candidate(
+        expression,
+        score,
+        error,
+        complexity,
+        coverage,
+        novelty,
+        "invariant"
+    )
+
+# ============================================================
+# 20. EQUIVALENCE CHECKING
+# ============================================================
+
+def numerically_equivalent(
+    a,
+    b,
+    dataset,
+    tolerance=1e-4
+):
+
+    checked = 0
+
+    for row in dataset.rows[:100]:
+
+        av = a.evaluate(row)
+        bv = b.evaluate(row)
+
+        if av is None or bv is None:
+            continue
+
+        if (
+            not math.isfinite(av)
+            or not math.isfinite(bv)
+        ):
+            continue
+
+        scale = max(
+            abs(av),
+            abs(bv),
             1e-10
         )
 
-        relative_error = (
-            abs(prediction - actual)
-            / denominator
-        )
+        if (
+            abs(av - bv)
+            / scale
+            > tolerance
+        ):
 
-        total_error += relative_error
+            return False
 
-        valid += 1
+        checked += 1
 
-    if valid == 0:
-
-        return float("inf")
-
-    error = (
-        total_error / valid
-    )
-
-    # Complexity penalty
-    complexity = expression.size()
-
-    complexity_penalty = (
-        complexity * 0.00005
-    )
-
-    # Depth penalty
-    depth_penalty = (
-        expression.depth() * 0.00002
-    )
-
-    return (
-        error
-        + complexity_penalty
-        + depth_penalty
-    )
-
+    return checked >= 10
 
 # ============================================================
-# 11. TRAIN / TEST SPLIT
+# 21. DISCOVERY ARCHIVE
 # ============================================================
 
-def split_data(
-    dataset,
-    ratio=0.8
-):
+class DiscoveryArchive:
 
-    shuffled = dataset.copy()
+    def __init__(self, limit=ARCHIVE_LIMIT):
 
-    random.shuffle(shuffled)
+        self.limit = limit
 
-    cut = int(
-        len(shuffled) * ratio
-    )
+        self.entries = []
 
-    return (
-        shuffled[:cut],
-        shuffled[cut:]
-    )
+        self.keys = set()
 
-
-# ============================================================
-# 12. DISCOVERY
-# ============================================================
-
-def discover(
-    dataset,
-    target,
-    grammar,
-    generations=500
-):
-
-    population_size = 500
-
-    train, test = split_data(
-        dataset
-    )
-
-    population = [
-        random_expression(
-            grammar,
-            max_depth=4
-        )
-        for _ in range(
-            population_size
-        )
-    ]
-
-    archive = {}
-
-    best_expression = None
-    best_score = float("inf")
-
-    stagnant_generations = 0
-
-    for generation in range(
-        generations
+    def contains(
+        self,
+        expression
     ):
 
-        scored = []
+        return (
+            canonical(expression)
+            in self.keys
+        )
 
-        # ----------------------------------------------------
-        # Evaluate
-        # ----------------------------------------------------
+    def add(
+        self,
+        candidate
+    ):
 
-        for expression in population:
+        expression = candidate.expression
+
+        key = canonical(
+            expression
+        )
+
+        if key in self.keys:
+
+            return False
+
+        # Avoid obvious duplicate forms.
+
+        for existing in self.entries:
+
+            if (
+                expression.variables_used()
+                == existing.expression.variables_used()
+            ):
+
+                if numerically_equivalent(
+                    expression,
+                    existing.expression,
+                    CURRENT_DATASET
+                ):
+
+                    return False
+
+        self.entries.append(
+            candidate
+        )
+
+        self.keys.add(key)
+
+        self.entries.sort(
+            key=lambda c: c.score
+        )
+
+        if len(self.entries) > self.limit:
+
+            removed = self.entries.pop()
+
+            self.keys.discard(
+                canonical(
+                    removed.expression
+                )
+            )
+
+        return True
+
+    def expressions(self):
+
+        return [
+            candidate.expression
+            for candidate in self.entries
+        ]
+
+# ============================================================
+# 22. TARGET VARIABLE FILTER
+# ============================================================
+
+def useful_target(
+    expression,
+    target
+):
+
+    variables = (
+        expression.variables_used()
+    )
+
+    # A prediction of a variable by itself
+    # is trivial and should not count.
+
+    if variables == {target}:
+
+        return False
+
+    return True
+
+# ============================================================
+# 23. TOURNAMENT SELECTION
+# ============================================================
+
+def tournament(
+    scored
+):
+
+    candidates = random.sample(
+        scored,
+        min(
+            TOURNAMENT_SIZE,
+            len(scored)
+        )
+    )
+
+    candidates.sort(
+        key=lambda c: c.score
+    )
+
+    return candidates[0].expression
+
+# ============================================================
+# 24. DISCOVERY ENGINE
+# ============================================================
+
+CURRENT_DATASET = None
+
+class DiscoveryEngine:
+
+    def __init__(
+        self,
+        dataset
+    ):
+
+        global CURRENT_DATASET
+
+        CURRENT_DATASET = dataset
+
+        self.dataset = dataset
+
+        self.train, self.test = (
+            dataset.split()
+        )
+
+        self.grammar = Grammar(
+            dataset.variables
+        )
+
+        self.archive = (
+            DiscoveryArchive()
+        )
+
+        self.population = []
+
+        self.best_candidates = []
+
+        self.stagnation = 0
+
+        self.generation = 0
+
+    # --------------------------------------------------------
+    # Initial population
+    # --------------------------------------------------------
+
+    def initialize(self):
+
+        self.population = []
+
+        for _ in range(
+            POPULATION_SIZE
+        ):
+
+            expression = (
+                random_expression(
+                    self.grammar,
+                    max_depth=INITIAL_DEPTH
+                )
+            )
 
             expression = simplify(
                 expression
             )
 
-            score = score_expression(
-                expression,
-                train,
-                target
+            self.population.append(
+                expression
             )
 
-            scored.append(
-                (
-                    score,
-                    expression
-                )
-            )
+    # --------------------------------------------------------
+    # Score population
+    # --------------------------------------------------------
 
-            key = str(expression)
+    def score_population(
+        self
+    ):
+
+        scored = []
+
+        # Half population predictive.
+
+        for expression in self.population:
+
+            expression = simplify(
+                expression
+            )
 
             if (
-                key not in archive
-                or score < archive[key]
+                expression.size()
+                > MAX_TREE_SIZE
             ):
 
-                archive[key] = score
+                continue
 
-            if score < best_score:
+            if (
+                expression.depth()
+                > MAX_TREE_DEPTH
+            ):
 
-                best_score = score
+                continue
 
-                best_expression = (
-                    expression.clone()
+            # ------------------------------------------------
+            # Predictive discoveries.
+            # ------------------------------------------------
+
+            for target in self.dataset.variables:
+
+                if not useful_target(
+                    expression,
+                    target
+                ):
+
+                    continue
+
+                candidate = (
+                    score_predictive_candidate(
+                        expression,
+                        self.train,
+                        target,
+                        self.archive.expressions()
+                    )
                 )
 
-                stagnant_generations = 0
+                if math.isfinite(
+                    candidate.score
+                ):
 
-            else:
+                    scored.append(
+                        candidate
+                    )
 
-                stagnant_generations += 1
+            # ------------------------------------------------
+            # Invariant discoveries.
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # Safety fallback
-        # ----------------------------------------------------
-
-        if best_expression is None:
-
-            best_expression = random_expression(
-                grammar,
-                max_depth=3
+            invariant = (
+                score_invariant_candidate(
+                    expression,
+                    self.train,
+                    self.archive.expressions()
+                )
             )
 
-            best_score = score_expression(
-                best_expression,
-                train,
-                target
-            )
+            if math.isfinite(
+                invariant.score
+            ):
 
-        # ----------------------------------------------------
-        # Sort
-        # ----------------------------------------------------
+                scored.append(
+                    invariant
+                )
 
         scored.sort(
-            key=lambda x: x[0]
+            key=lambda c: c.score
         )
 
-        # ----------------------------------------------------
-        # Elitism
-        # ----------------------------------------------------
+        return scored
 
-        elite_count = max(
-            10,
-            population_size // 20
-        )
+    # --------------------------------------------------------
+    # Add discoveries.
+    # --------------------------------------------------------
 
-        elites = [
-            expression.clone()
-            for _, expression
-            in scored[:elite_count]
+    def update_archive(
+        self,
+        scored
+    ):
+
+        added = []
+
+        for candidate in scored[:100]:
+
+            if candidate.error > 0.02:
+
+                continue
+
+            if candidate.coverage < 0.85:
+
+                continue
+
+            if self.archive.add(
+                candidate
+            ):
+
+                added.append(
+                    candidate
+                )
+
+        return added
+
+    # --------------------------------------------------------
+    # Build new population.
+    # --------------------------------------------------------
+
+    def reproduce(
+        self,
+        scored
+    ):
+
+        new_population = []
+
+        valid = [
+            candidate
+            for candidate in scored
+            if math.isfinite(
+                candidate.score
+            )
         ]
 
-        # ----------------------------------------------------
-        # Print progress
-        # ----------------------------------------------------
+        if not valid:
 
-        if generation % 25 == 0:
-
-            test_score = score_expression(
-                best_expression,
-                test,
-                target
-            )
-
-            print(
-                f"Generation {generation:4d} | "
-                f"train={best_score:.10f} | "
-                f"test={test_score:.10f}"
-            )
-
-            print(
-                "     ",
-                best_expression
-            )
-
-        # ----------------------------------------------------
-        # Perfect-ish discovery
-        # ----------------------------------------------------
-
-        if best_score < 0.0001:
-
-            break
-
-        # ----------------------------------------------------
-        # Grow grammar if stuck
-        # ----------------------------------------------------
-
-        if stagnant_generations > 75:
-
-            if grammar.growth_level < 6:
-
-                grammar.grow()
-
-            stagnant_generations = 0
-
-        # ----------------------------------------------------
-        # Build next generation
-        # ----------------------------------------------------
-
-        new_population = elites.copy()
-
-        # Tournament pool
-        pool = [
-            expression
-            for _, expression
-            in scored[:100]
-        ]
-
-        # Safety
-        if not pool:
-
-            pool = [
+            return [
                 random_expression(
-                    grammar,
+                    self.grammar,
                     max_depth=3
                 )
-                for _ in range(20)
+                for _ in range(
+                    POPULATION_SIZE
+                )
             ]
+
+        # Elite expressions.
+
+        elite_expressions = []
+
+        seen = set()
+
+        for candidate in valid:
+
+            key = canonical(
+                candidate.expression
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            elite_expressions.append(
+                candidate.expression.clone()
+            )
+
+            if len(
+                elite_expressions
+            ) >= ELITE_COUNT:
+
+                break
+
+        new_population.extend(
+            elite_expressions
+        )
 
         while len(
             new_population
-        ) < population_size:
+        ) < POPULATION_SIZE:
 
-            parent_a = random.choice(
-                pool
+            parent_a = tournament(
+                valid
             )
 
-            # ------------------------------------------------
-            # Crossover
-            # ------------------------------------------------
+            if (
+                random.random()
+                < CROSSOVER_RATE
+            ):
 
-            if random.random() < 0.35:
-
-                parent_b = random.choice(
-                    pool
+                parent_b = tournament(
+                    valid
                 )
 
                 child = crossover(
@@ -1458,44 +2260,28 @@ def discover(
 
                 child = parent_a.clone()
 
-            # ------------------------------------------------
-            # If crossover somehow produces None
-            # ------------------------------------------------
+            if random.random() < MUTATION_RATE:
 
-            if child is None:
-
-                child = random_expression(
-                    grammar,
-                    max_depth=3
+                child = mutate(
+                    child,
+                    self.grammar
                 )
-
-            # ------------------------------------------------
-            # Mutation
-            # ------------------------------------------------
-
-            child = mutate(
-                child,
-                grammar,
-                probability=0.35
-            )
-
-            # ------------------------------------------------
-            # Simplify
-            # ------------------------------------------------
 
             child = simplify(
                 child
             )
 
-            # ------------------------------------------------
-            # Reject absurd trees
-            # ------------------------------------------------
-
-            if child.size() > 35:
+            if (
+                child.size()
+                > MAX_TREE_SIZE
+            ):
 
                 continue
 
-            if child.depth() > 15:
+            if (
+                child.depth()
+                > MAX_TREE_DEPTH
+            ):
 
                 continue
 
@@ -1503,201 +2289,851 @@ def discover(
                 child
             )
 
-        population = new_population
+        return new_population
 
-    return (
-        best_expression,
-        best_score,
-        score_expression(
-            best_expression,
-            test,
-            target
-        ),
-        archive
-    )
+    # --------------------------------------------------------
+    # Test candidate.
+    # --------------------------------------------------------
 
+    def test_candidate(
+        self,
+        candidate
+    ):
+
+        if candidate.kind == "predictive":
+
+            error, coverage = (
+                predictive_error(
+                    candidate.expression,
+                    self.test,
+                    candidate.target
+                )
+            )
+
+            return error, coverage
+
+        error, coverage, constant = (
+            invariant_error(
+                candidate.expression,
+                self.test
+            )
+        )
+
+        return error, coverage
+
+    # --------------------------------------------------------
+    # Print discovery.
+    # --------------------------------------------------------
+
+    def print_discovery(
+        self,
+        candidate,
+        test_error,
+        test_coverage
+    ):
+
+        print()
+        print(
+            "------------------------------------------------------------"
+        )
+
+        print(
+            "[NEW DISCOVERY]"
+        )
+
+        if candidate.kind == "predictive":
+
+            print(
+                f"{candidate.target} ≈ "
+                f"{candidate.expression}"
+            )
+
+        else:
+
+            print(
+                f"{candidate.expression} ≈ CONSTANT"
+            )
+
+        print(
+            f"train error : "
+            f"{candidate.error:.8g}"
+        )
+
+        print(
+            f"test error  : "
+            f"{test_error:.8g}"
+        )
+
+        print(
+            f"coverage    : "
+            f"{candidate.coverage:.3f}"
+            f" / test "
+            f"{test_coverage:.3f}"
+        )
+
+        print(
+            f"complexity  : "
+            f"{candidate.complexity}"
+        )
+
+        print(
+            f"novelty     : "
+            f"{candidate.novelty:.3f}"
+        )
+
+        print(
+            f"kind        : "
+            f"{candidate.kind}"
+        )
+
+    # --------------------------------------------------------
+    # Run.
+    # --------------------------------------------------------
+
+    def run(
+        self,
+        generations=GENERATIONS
+    ):
+
+        self.initialize()
+
+        print()
+        print(
+            "=" * 70
+        )
+
+        print(
+            "PHYDISCOVER V3"
+        )
+
+        print(
+            "OPEN-ENDED LEVEL-1 MATHEMATICAL DISCOVERY"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        print(
+            f"Variables: "
+            f"{', '.join(self.dataset.variables)}"
+        )
+
+        print(
+            f"Rows: "
+            f"{len(self.dataset.rows)}"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        for generation in range(
+            generations
+        ):
+
+            self.generation = generation
+
+            scored = (
+                self.score_population()
+            )
+
+            if not scored:
+
+                self.grammar.grow()
+
+                self.initialize()
+
+                continue
+
+            best = scored[0]
+
+            discoveries = (
+                self.update_archive(
+                    scored
+                )
+            )
+
+            for discovery in discoveries:
+
+                test_error, test_coverage = (
+                    self.test_candidate(
+                        discovery
+                    )
+                )
+
+                if (
+                    math.isfinite(
+                        test_error
+                    )
+                    and test_coverage >= 0.80
+                ):
+
+                    self.print_discovery(
+                        discovery,
+                        test_error,
+                        test_coverage
+                    )
+
+            # ------------------------------------------------
+            # Progress.
+            # ------------------------------------------------
+
+            if generation % 20 == 0:
+
+                test_error, test_coverage = (
+                    self.test_candidate(
+                        best
+                    )
+                )
+
+                print(
+                    f"\nGeneration "
+                    f"{generation:4d}"
+                )
+
+                print(
+                    f"Best: "
+                    f"{best.expression}"
+                )
+
+                print(
+                    f"Score: "
+                    f"{best.score:.8g}"
+                )
+
+                print(
+                    f"Train error: "
+                    f"{best.error:.8g}"
+                )
+
+                print(
+                    f"Test error: "
+                    f"{test_error:.8g}"
+                )
+
+                print(
+                    f"Archive: "
+                    f"{len(self.archive.entries)}"
+                )
+
+            # ------------------------------------------------
+            # Stagnation.
+            # ------------------------------------------------
+
+            if discoveries:
+
+                self.stagnation = 0
+
+            else:
+
+                self.stagnation += 1
+
+            # ------------------------------------------------
+            # Grammar growth.
+            # ------------------------------------------------
+
+            if (
+                self.stagnation > 45
+            ):
+
+                if self.grammar.level < 6:
+
+                    self.grammar.grow()
+
+                    self.stagnation = 0
+
+            # ------------------------------------------------
+            # Reproduce.
+            # ------------------------------------------------
+
+            self.population = (
+                self.reproduce(
+                    scored
+                )
+            )
+
+        return self.archive
 
 # ============================================================
-# 13. DISCOVERY REPORT
+# 25. DISCOVERY REPORT
 # ============================================================
 
-def report(
-    target,
-    expression,
-    train_error,
-    test_error
+def print_final_archive(
+    archive,
+    dataset
 ):
 
     print()
-    print("=" * 70)
-
-    print(
-        f"DISCOVERY: {target}"
-    )
-
-    print("=" * 70)
-
     print()
-
     print(
-        f"{target} = {expression}"
-    )
-
-    print()
-
-    print(
-        f"Training error : "
-        f"{train_error:.12f}"
+        "=" * 70
     )
 
     print(
-        f"Testing error  : "
-        f"{test_error:.12f}"
+        "FINAL DISCOVERY ARCHIVE"
     )
 
     print(
-        f"Complexity     : "
-        f"{expression.size()}"
+        "=" * 70
     )
 
-    print(
-        f"Depth          : "
-        f"{expression.depth()}"
-    )
+    if not archive.entries:
 
-    print()
+        print(
+            "No robust discoveries found."
+        )
 
+        return
+
+    for index, candidate in enumerate(
+        archive.entries,
+        1
+    ):
+
+        print()
+        print(
+            f"[{index}]"
+        )
+
+        if candidate.kind == "predictive":
+
+            print(
+                f"{candidate.target} ≈ "
+                f"{candidate.expression}"
+            )
+
+        else:
+
+            print(
+                f"{candidate.expression} ≈ constant"
+            )
+
+        print(
+            f"error={candidate.error:.8g} | "
+            f"complexity={candidate.complexity} | "
+            f"coverage={candidate.coverage:.3f}"
+        )
+
+        # Re-test on unseen data.
+
+        if candidate.kind == "predictive":
+
+            error, coverage = (
+                predictive_error(
+                    candidate.expression,
+                    dataset,
+                    candidate.target
+                )
+            )
+
+        else:
+
+            error, coverage, constant = (
+                invariant_error(
+                    candidate.expression,
+                    dataset
+                )
+            )
+
+        print(
+            f"full-data error={error:.8g} | "
+            f"coverage={coverage:.3f}"
+        )
 
 # ============================================================
-# 14. MAIN
+# 26. DISCOVERY OF PAIRWISE RATIOS
+#
+# This additional deterministic layer searches for simple
+# relationships of the form:
+#
+#   A / B ≈ constant
+#
+# and:
+#
+#   A * B ≈ constant
+#
+# These are useful because they can expose relationships that
+# GP may take longer to discover.
+# ============================================================
+
+def discover_simple_invariants(
+    dataset,
+    archive
+):
+
+    variables = dataset.variables
+
+    for i in range(
+        len(variables)
+    ):
+
+        for j in range(
+            i + 1,
+            len(variables)
+        ):
+
+            a = variables[i]
+            b = variables[j]
+
+            # A / B
+
+            ratio = Node(
+                op="/",
+                left=Node(value=a),
+                right=Node(value=b)
+            )
+
+            candidate = (
+                score_invariant_candidate(
+                    ratio,
+                    dataset,
+                    archive.expressions()
+                )
+            )
+
+            if (
+                candidate.error < 0.02
+                and candidate.coverage > 0.9
+            ):
+
+                archive.add(
+                    candidate
+                )
+
+            # A * B
+
+            product = Node(
+                op="*",
+                left=Node(value=a),
+                right=Node(value=b)
+            )
+
+            candidate = (
+                score_invariant_candidate(
+                    product,
+                    dataset,
+                    archive.expressions()
+                )
+            )
+
+            if (
+                candidate.error < 0.02
+                and candidate.coverage > 0.9
+            ):
+
+                archive.add(
+                    candidate
+                )
+
+# ============================================================
+# 27. DIMENSIONLESS / RELATIVE RELATION SEARCH
+# ============================================================
+
+def discover_power_ratios(
+    dataset,
+    archive
+):
+
+    variables = dataset.variables
+
+    powers = [
+        -2,
+        -1,
+        -0.5,
+        0.5,
+        1,
+        2
+    ]
+
+    for target in variables:
+
+        for a in variables:
+
+            if a == target:
+                continue
+
+            for power in powers:
+
+                expression = Node(
+                    op="*",
+                    left=Node(
+                        value=target
+                    ),
+                    right=Node(
+                        op="^",
+                        left=Node(value=a),
+                        right=Node(
+                            value=power
+                        )
+                    )
+                )
+
+                candidate = (
+                    score_invariant_candidate(
+                        expression,
+                        dataset,
+                        archive.expressions()
+                    )
+                )
+
+                if (
+                    candidate.error
+                    < 0.01
+                    and candidate.coverage
+                    > 0.9
+                ):
+
+                    archive.add(
+                        candidate
+                    )
+
+# ============================================================
+# 28. HIDDEN CONSTANT ESTIMATION
+# ============================================================
+
+def estimate_constant(
+    expression,
+    dataset
+):
+
+    values = []
+
+    for row in dataset.rows:
+
+        value = expression.evaluate(
+            row
+        )
+
+        if value is None:
+            continue
+
+        if not math.isfinite(value):
+            continue
+
+        values.append(value)
+
+    if not values:
+        return None
+
+    values.sort()
+
+    middle = len(values) // 2
+
+    if len(values) % 2 == 0:
+
+        return (
+            values[middle - 1]
+            + values[middle]
+        ) / 2
+
+    return values[middle]
+
+# ============================================================
+# 29. CONSTANT-AWARE DISCOVERY
+#
+# Converts:
+#
+#   A/(x*y) ≈ 2.75
+#
+# into:
+#
+#   A ≈ 2.75*x*y
+#
+# when appropriate.
+# ============================================================
+
+def convert_invariant_to_prediction(
+    candidate,
+    dataset
+):
+
+    expression = candidate.expression
+
+    constant = estimate_constant(
+        expression,
+        dataset
+    )
+
+    if constant is None:
+        return None
+
+    if not math.isfinite(constant):
+        return None
+
+    if abs(constant) > 1e8:
+        return None
+
+    # Try:
+    #
+    # expression ≈ c
+    #
+    # If expression is:
+    #
+    # A / f
+    #
+    # then construct:
+    #
+    # A ≈ c*f
+
+    if (
+        not expression.is_leaf()
+        and expression.op == "/"
+    ):
+
+        numerator = expression.left
+        denominator = expression.right
+
+        if (
+            numerator is not None
+            and denominator is not None
+            and len(
+                numerator.variables_used()
+            ) > 0
+        ):
+
+            prediction = simplify(
+                Node(
+                    op="*",
+                    left=Node(
+                        value=constant
+                    ),
+                    right=denominator.clone()
+                )
+            )
+
+            targets = (
+                numerator.variables_used()
+            )
+
+            if len(targets) == 1:
+
+                target = next(
+                    iter(targets)
+                )
+
+                candidate = (
+                    score_predictive_candidate(
+                        prediction,
+                        dataset,
+                        target,
+                        []
+                    )
+                )
+
+                if math.isfinite(
+                    candidate.score
+                ):
+
+                    return candidate
+
+    return None
+
+# ============================================================
+# 30. DISCOVERY LOOP FOR INVARIANTS
+# ============================================================
+
+def expand_archive_with_derived_forms(
+    archive,
+    dataset
+):
+
+    new_candidates = []
+
+    for candidate in list(
+        archive.entries
+    ):
+
+        if candidate.kind != "invariant":
+            continue
+
+        derived = (
+            convert_invariant_to_prediction(
+                candidate,
+                dataset
+            )
+        )
+
+        if derived is None:
+            continue
+
+        if (
+            derived.error < 0.02
+            and derived.coverage > 0.9
+        ):
+
+            if archive.add(
+                derived
+            ):
+
+                new_candidates.append(
+                    derived
+                )
+
+    return new_candidates
+
+# ============================================================
+# 31. BOOTSTRAP DISCOVERY
+# ============================================================
+
+def bootstrap_discovery(
+    dataset,
+    archive
+):
+
+    discover_simple_invariants(
+        dataset,
+        archive
+    )
+
+    discover_power_ratios(
+        dataset,
+        archive
+    )
+
+    expand_archive_with_derived_forms(
+        archive,
+        dataset
+    )
+
+# ============================================================
+# 32. MAIN
 # ============================================================
 
 def main():
 
     print()
-    print("=" * 70)
-
     print(
-        "        PHYDISCOVER V2"
+        "=" * 70
     )
 
     print(
-        "     SELF-GROWING PHYSICS AI"
+        "              PHYDISCOVER V3"
     )
 
-    print("=" * 70)
+    print(
+        "       OPEN-ENDED MATHEMATICAL AI"
+    )
 
-    data = make_data()
-
-    grammar = Grammar()
-
-    experiments = [
-
-        (
-            "Force",
-            data["F_ma"],
-            "F"
-        ),
-
-        (
-            "Velocity",
-            data["v_at"],
-            "v"
-        ),
-
-        (
-            "Position",
-            data["x_at"],
-            "x"
-        ),
-
-        (
-            "Momentum",
-            data["p_mv"],
-            "p"
-        ),
-
-        (
-            "Potential Energy",
-            data["E_mgh"],
-            "E"
-        ),
-
-        (
-            "Kinetic Energy",
-            data["KE"],
-            "KE"
-        )
-
-    ]
-
-    discoveries = {}
-
-    for name, dataset, target in experiments:
-
-        print()
-        print("-" * 70)
-
-        print(
-            f"DISCOVERING: {name}"
-        )
-
-        print("-" * 70)
-
-        result = discover(
-            dataset,
-            target,
-            grammar,
-            generations=500
-        )
-
-        (
-            expression,
-            train_error,
-            test_error,
-            archive
-        ) = result
-
-        discoveries[target] = (
-            expression,
-            train_error,
-            test_error
-        )
-
-        report(
-            target,
-            expression,
-            train_error,
-            test_error
-        )
-
-    # --------------------------------------------------------
-    # Final discoveries
-    # --------------------------------------------------------
+    print(
+        "=" * 70
+    )
 
     print()
-    print("=" * 70)
-
     print(
-        "              DISCOVERY ARCHIVE"
+        "The engine receives observations."
     )
 
-    print("=" * 70)
+    print(
+        "It is NOT given the hidden equations."
+    )
 
-    for target, result in discoveries.items():
-
-        expression = result[0]
-
-        print(
-            f"{target} = {expression}"
-        )
+    print(
+        "It searches for relationships autonomously."
+    )
 
     print()
 
-    print(
-        "Search complete."
+    dataset = (
+        make_experimental_data()
     )
 
+    print(
+        f"Dataset: "
+        f"{dataset.name}"
+    )
+
+    print(
+        f"Observations: "
+        f"{len(dataset.rows)}"
+    )
+
+    print(
+        f"Variables: "
+        f"{', '.join(dataset.variables)}"
+    )
+
+    print()
+
+    engine = DiscoveryEngine(
+        dataset
+    )
+
+    # --------------------------------------------------------
+    # Bootstrap with simple structural searches.
+    # --------------------------------------------------------
+
+    print(
+        "[BOOTSTRAP] Searching simple invariants..."
+    )
+
+    bootstrap_discovery(
+        dataset,
+        engine.archive
+    )
+
+    print(
+        f"[BOOTSTRAP] "
+        f"{len(engine.archive.entries)} "
+        f"candidate discoveries"
+    )
+
+    # --------------------------------------------------------
+    # Evolutionary discovery.
+    # --------------------------------------------------------
+
+    archive = engine.run(
+        generations=GENERATIONS
+    )
+
+    # --------------------------------------------------------
+    # Derive predictive equations from invariant discoveries.
+    # --------------------------------------------------------
+
+    for _ in range(3):
+
+        derived = (
+            expand_archive_with_derived_forms(
+                archive,
+                dataset
+            )
+        )
+
+        if not derived:
+            break
+
+    # --------------------------------------------------------
+    # Final archive.
+    # --------------------------------------------------------
+
+    print_final_archive(
+        archive,
+        dataset
+    )
+
+    print()
+    print(
+        "=" * 70
+    )
+
+    print(
+        "DISCOVERY COMPLETE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    print()
+    print(
+        "The equations in the archive were not supplied"
+    )
+
+    print(
+        "as targets to the evolutionary search."
+    )
+
+    print()
 
 # ============================================================
 # START
