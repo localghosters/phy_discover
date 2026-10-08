@@ -3,7 +3,8 @@ import math
 import copy
 
 # ============================================================
-# PHYDISCOVER V2
+# PHYDISCOVER V2.1
+# FIXED VERSION
 # ============================================================
 
 random.seed(42)
@@ -26,7 +27,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Newton:
-    #
     # F = ma
     # --------------------------------------------------------
 
@@ -45,7 +45,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Kinematics:
-    #
     # v = at
     # --------------------------------------------------------
 
@@ -64,7 +63,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Kinematics:
-    #
     # x = 1/2 at²
     # --------------------------------------------------------
 
@@ -83,7 +81,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Momentum:
-    #
     # p = mv
     # --------------------------------------------------------
 
@@ -102,7 +99,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Potential energy:
-    #
     # E = mgh
     # --------------------------------------------------------
 
@@ -123,7 +119,6 @@ def make_data():
 
     # --------------------------------------------------------
     # Kinetic energy:
-    #
     # KE = 1/2 mv²
     # --------------------------------------------------------
 
@@ -148,6 +143,16 @@ def make_data():
 # ============================================================
 
 class Node:
+
+    UNARY_OPS = {
+        "sin",
+        "cos",
+        "exp",
+        "log",
+        "sqrt",
+        "abs",
+        "neg"
+    }
 
     def __init__(
         self,
@@ -194,19 +199,21 @@ class Node:
 
         try:
 
-            if self.op in [
-                "sin",
-                "cos",
-                "exp",
-                "log",
-                "sqrt",
-                "abs",
-                "neg"
-            ]:
+            # ------------------------------------------------
+            # Unary operation
+            # ------------------------------------------------
+
+            if self.op in Node.UNARY_OPS:
+
+                if self.left is None:
+                    return None
 
                 x = self.left.evaluate(variables)
 
                 if x is None:
+                    return None
+
+                if not math.isfinite(x):
                     return None
 
                 if self.op == "sin":
@@ -242,29 +249,45 @@ class Node:
                 if self.op == "neg":
                     return -x
 
+            # ------------------------------------------------
+            # Binary operation
+            # ------------------------------------------------
+
+            if self.left is None or self.right is None:
+                return None
+
             left = self.left.evaluate(variables)
             right = self.right.evaluate(variables)
 
             if left is None or right is None:
                 return None
 
+            if not math.isfinite(left):
+                return None
+
+            if not math.isfinite(right):
+                return None
+
             if self.op == "+":
-                return left + right
 
-            if self.op == "-":
-                return left - right
+                result = left + right
 
-            if self.op == "*":
-                return left * right
+            elif self.op == "-":
 
-            if self.op == "/":
+                result = left - right
+
+            elif self.op == "*":
+
+                result = left * right
+
+            elif self.op == "/":
 
                 if abs(right) < 1e-12:
                     return None
 
-                return left / right
+                result = left / right
 
-            if self.op == "^":
+            elif self.op == "^":
 
                 # Avoid explosive expressions
                 if abs(left) > 1e6:
@@ -273,16 +296,23 @@ class Node:
                 if abs(right) > 10:
                     return None
 
-                # Non-integer powers of negative numbers
-                if left < 0 and abs(right - round(right)) > 1e-10:
+                # Negative number to non-integer power
+                if (
+                    left < 0
+                    and abs(right - round(right)) > 1e-10
+                ):
                     return None
 
                 result = left ** right
 
-                if not math.isfinite(result):
-                    return None
+            else:
 
-                return result
+                return None
+
+            if not math.isfinite(result):
+                return None
+
+            return result
 
         except (
             ValueError,
@@ -291,8 +321,6 @@ class Node:
         ):
 
             return None
-
-        return None
 
     # --------------------------------------------------------
     # String representation
@@ -308,22 +336,29 @@ class Node:
 
             return str(self.value)
 
-        if self.op in [
-            "sin",
-            "cos",
-            "exp",
-            "log",
-            "sqrt",
-            "abs",
-            "neg"
-        ]:
+        if self.op in Node.UNARY_OPS:
+
+            if self.left is None:
+                return f"{self.op}(?)"
 
             return f"{self.op}({self.left})"
 
+        left_string = (
+            str(self.left)
+            if self.left is not None
+            else "?"
+        )
+
+        right_string = (
+            str(self.right)
+            if self.right is not None
+            else "?"
+        )
+
         return (
-            f"({self.left} "
+            f"({left_string} "
             f"{self.op} "
-            f"{self.right})"
+            f"{right_string})"
         )
 
     # --------------------------------------------------------
@@ -335,23 +370,26 @@ class Node:
         if self.is_leaf():
             return 1
 
-        if self.op in [
-            "sin",
-            "cos",
-            "exp",
-            "log",
-            "sqrt",
-            "abs",
-            "neg"
-        ]:
+        if self.op in Node.UNARY_OPS:
+
+            if self.left is None:
+                return 1
 
             return 1 + self.left.size()
 
-        return (
-            1
-            + self.left.size()
-            + self.right.size()
+        left_size = (
+            self.left.size()
+            if self.left is not None
+            else 0
         )
+
+        right_size = (
+            self.right.size()
+            if self.right is not None
+            else 0
+        )
+
+        return 1 + left_size + right_size
 
     # --------------------------------------------------------
     # Maximum depth
@@ -362,24 +400,28 @@ class Node:
         if self.is_leaf():
             return 1
 
-        if self.op in [
-            "sin",
-            "cos",
-            "exp",
-            "log",
-            "sqrt",
-            "abs",
-            "neg"
-        ]:
+        if self.op in Node.UNARY_OPS:
+
+            if self.left is None:
+                return 1
 
             return 1 + self.left.depth()
 
-        return (
-            1
-            + max(
-                self.left.depth(),
-                self.right.depth()
-            )
+        left_depth = (
+            self.left.depth()
+            if self.left is not None
+            else 0
+        )
+
+        right_depth = (
+            self.right.depth()
+            if self.right is not None
+            else 0
+        )
+
+        return 1 + max(
+            left_depth,
+            right_depth
         )
 
 
@@ -390,10 +432,6 @@ class Node:
 class Grammar:
 
     def __init__(self):
-
-        # Initially small.
-        #
-        # The algorithm can expand this later.
 
         self.variables = set([
             "m",
@@ -435,10 +473,10 @@ class Grammar:
 
         self.growth_level += 1
 
-        # Add powers
         if self.growth_level == 1:
 
             if "^" not in self.binary_ops:
+
                 self.binary_ops.append("^")
 
             self.powers.extend([
@@ -446,32 +484,40 @@ class Grammar:
                 3.0
             ])
 
-        # Add useful unary functions
         elif self.growth_level == 2:
 
-            self.unary_ops.extend([
+            for op in [
                 "sqrt",
                 "abs",
                 "neg"
-            ])
+            ]:
 
-        # Add more mathematical functions
+                if op not in self.unary_ops:
+
+                    self.unary_ops.append(op)
+
         elif self.growth_level == 3:
 
-            self.unary_ops.extend([
+            for op in [
                 "log",
                 "exp"
-            ])
+            ]:
 
-        # Add trigonometric functions
+                if op not in self.unary_ops:
+
+                    self.unary_ops.append(op)
+
         elif self.growth_level == 4:
 
-            self.unary_ops.extend([
+            for op in [
                 "sin",
                 "cos"
-            ])
+            ]:
 
-        # Learn small constants
+                if op not in self.unary_ops:
+
+                    self.unary_ops.append(op)
+
         elif self.growth_level >= 5:
 
             candidates = [
@@ -485,6 +531,7 @@ class Grammar:
             for c in candidates:
 
                 if c not in self.constants:
+
                     self.constants.append(c)
 
         print(
@@ -566,7 +613,7 @@ def random_expression(
         grammar.binary_ops
     )
 
-    # Occasionally create a known power
+    # Power uses a known numerical exponent
     if op == "^":
 
         right = Node(
@@ -588,7 +635,6 @@ def random_expression(
 
 def random_constant():
 
-    # Small useful constants
     candidates = [
         0.1,
         0.25,
@@ -614,13 +660,15 @@ def random_constant():
 
 def mutate_constant(node):
 
+    if node is None:
+        return Node(value=random_constant())
+
     if not node.is_leaf():
-        return node
+        return node.clone()
 
     if isinstance(node.value, str):
-        return node
+        return node.clone()
 
-    # Small numerical perturbation
     if random.random() < 0.5:
 
         scale = random.uniform(
@@ -651,11 +699,25 @@ def mutate(
     probability=0.20
 ):
 
+    # --------------------------------------------------------
+    # Safety against None
+    # --------------------------------------------------------
+
+    if node is None:
+
+        return random_expression(
+            grammar,
+            max_depth=3
+        )
+
     if random.random() > probability:
 
         return node.clone()
 
+    # --------------------------------------------------------
     # Completely replace subtree
+    # --------------------------------------------------------
+
     if random.random() < 0.12:
 
         return random_expression(
@@ -663,21 +725,19 @@ def mutate(
             max_depth=3
         )
 
+    # --------------------------------------------------------
     # Leaf mutation
+    # --------------------------------------------------------
+
     if node.is_leaf():
 
         return mutate_constant(node)
 
+    # --------------------------------------------------------
     # Unary
-    if node.op in [
-        "sin",
-        "cos",
-        "exp",
-        "log",
-        "sqrt",
-        "abs",
-        "neg"
-    ]:
+    # --------------------------------------------------------
+
+    if node.op in Node.UNARY_OPS:
 
         return Node(
             op=node.op,
@@ -688,41 +748,86 @@ def mutate(
             )
         )
 
-    # Change operator
+    # --------------------------------------------------------
+    # Binary
+    # --------------------------------------------------------
+
     if random.random() < 0.20:
 
         new_op = random.choice(
             grammar.binary_ops
         )
 
+        left = (
+            node.left.clone()
+            if node.left is not None
+            else random_leaf(grammar)
+        )
+
+        right = (
+            node.right.clone()
+            if node.right is not None
+            else random_leaf(grammar)
+        )
+
+        if new_op == "^":
+
+            right = Node(
+                value=random.choice(
+                    grammar.powers
+                )
+            )
+
         return Node(
             op=new_op,
-            left=node.left.clone(),
-            right=node.right.clone()
+            left=left,
+            right=right
         )
 
+    # --------------------------------------------------------
     # Mutate left
+    # --------------------------------------------------------
+
     if random.random() < 0.5:
 
-        return Node(
-            op=node.op,
-            left=mutate(
-                node.left,
-                grammar,
-                probability
-            ),
-            right=node.right.clone()
-        )
-
-    # Mutate right
-    return Node(
-        op=node.op,
-        left=node.left.clone(),
-        right=mutate(
-            node.right,
+        left = mutate(
+            node.left,
             grammar,
             probability
         )
+
+        right = (
+            node.right.clone()
+            if node.right is not None
+            else random_leaf(grammar)
+        )
+
+        return Node(
+            op=node.op,
+            left=left,
+            right=right
+        )
+
+    # --------------------------------------------------------
+    # Mutate right
+    # --------------------------------------------------------
+
+    left = (
+        node.left.clone()
+        if node.left is not None
+        else random_leaf(grammar)
+    )
+
+    right = mutate(
+        node.right,
+        grammar,
+        probability
+    )
+
+    return Node(
+        op=node.op,
+        left=left,
+        right=right
     )
 
 
@@ -732,11 +837,36 @@ def mutate(
 
 def crossover(a, b):
 
-    # Occasionally simply clone
-    if random.random() < 0.10:
+    # ========================================================
+    # IMPORTANT FIX
+    #
+    # The old version assumed that a and b were always Node
+    # objects. Some recursive paths could pass None.
+    #
+    # We now explicitly handle None.
+    # ========================================================
+
+    if a is None and b is None:
+        return None
+
+    if a is None:
+        return b.clone() if b is not None else None
+
+    if b is None:
         return a.clone()
 
-    # Replace one subtree with another
+    # --------------------------------------------------------
+    # Occasionally simply clone
+    # --------------------------------------------------------
+
+    if random.random() < 0.10:
+
+        return a.clone()
+
+    # --------------------------------------------------------
+    # If either is a leaf, safely exchange subtree
+    # --------------------------------------------------------
+
     if a.is_leaf():
 
         return b.clone()
@@ -745,28 +875,116 @@ def crossover(a, b):
 
         return a.clone()
 
-    if random.random() < 0.5:
+    # --------------------------------------------------------
+    # Unary node
+    # --------------------------------------------------------
+
+    if a.op in Node.UNARY_OPS:
+
+        # If B is unary, crossover its child.
+        if b.op in Node.UNARY_OPS:
+
+            return Node(
+                op=a.op,
+                left=crossover(
+                    a.left,
+                    b.left
+                )
+            )
+
+        # Otherwise use B as possible subtree.
+        if random.random() < 0.5:
+
+            return Node(
+                op=a.op,
+                left=crossover(
+                    a.left,
+                    b
+                )
+            )
+
+        return a.clone()
+
+    # --------------------------------------------------------
+    # If A is binary but B is unary
+    # --------------------------------------------------------
+
+    if b.op in Node.UNARY_OPS:
+
+        if random.random() < 0.5:
+
+            return Node(
+                op=a.op,
+                left=crossover(
+                    a.left,
+                    b
+                ),
+                right=(
+                    a.right.clone()
+                    if a.right is not None
+                    else None
+                )
+            )
 
         return Node(
             op=a.op,
-            left=crossover(
-                a.left,
-                b
+            left=(
+                a.left.clone()
+                if a.left is not None
+                else None
             ),
-            right=a.right.clone()
+            right=crossover(
+                a.right,
+                b
+            )
+        )
+
+    # --------------------------------------------------------
+    # Normal binary crossover
+    # --------------------------------------------------------
+
+    if random.random() < 0.5:
+
+        new_left = crossover(
+            a.left,
+            b.left
+        )
+
+        new_right = (
+            a.right.clone()
             if a.right is not None
+            else (
+                b.right.clone()
+                if b.right is not None
+                else None
+            )
+        )
+
+        return Node(
+            op=a.op,
+            left=new_left,
+            right=new_right
+        )
+
+    new_left = (
+        a.left.clone()
+        if a.left is not None
+        else (
+            b.left.clone()
+            if b.left is not None
             else None
         )
+    )
+
+    new_right = crossover(
+        a.right,
+        b.right
+    )
 
     return Node(
         op=a.op,
-        left=a.left.clone()
-        if a.left is not None
-        else None,
-        right=crossover(
-            a.right,
-            b
-        )
+        left=new_left,
+        right=new_right
     )
 
 
@@ -776,19 +994,23 @@ def crossover(a, b):
 
 def simplify(node):
 
-    if node.is_leaf():
-        return node
+    # --------------------------------------------------------
+    # None protection
+    # --------------------------------------------------------
 
+    if node is None:
+
+        return Node(value=0)
+
+    if node.is_leaf():
+
+        return node.clone()
+
+    # --------------------------------------------------------
     # Unary
-    if node.op in [
-        "sin",
-        "cos",
-        "exp",
-        "log",
-        "sqrt",
-        "abs",
-        "neg"
-    ]:
+    # --------------------------------------------------------
+
+    if node.op in Node.UNARY_OPS:
 
         child = simplify(node.left)
 
@@ -808,6 +1030,10 @@ def simplify(node):
             left=child
         )
 
+    # --------------------------------------------------------
+    # Binary
+    # --------------------------------------------------------
+
     left = simplify(node.left)
     right = simplify(node.right)
 
@@ -817,70 +1043,74 @@ def simplify(node):
 
     # x + 0
     if (
-        right.is_leaf()
+        node.op == "+"
+        and right.is_leaf()
         and right.value == 0
-        and node.op == "+"
     ):
+
         return left
 
     # 0 + x
     if (
-        left.is_leaf()
+        node.op == "+"
+        and left.is_leaf()
         and left.value == 0
-        and node.op == "+"
     ):
+
         return right
 
     # x - 0
     if (
-        right.is_leaf()
+        node.op == "-"
+        and right.is_leaf()
         and right.value == 0
-        and node.op == "-"
     ):
+
         return left
 
     # x * 1
     if (
-        right.is_leaf()
+        node.op == "*"
+        and right.is_leaf()
         and right.value == 1
-        and node.op == "*"
     ):
+
         return left
 
     # 1 * x
     if (
-        left.is_leaf()
+        node.op == "*"
+        and left.is_leaf()
         and left.value == 1
-        and node.op == "*"
     ):
+
         return right
 
     # x / 1
     if (
-        right.is_leaf()
+        node.op == "/"
+        and right.is_leaf()
         and right.value == 1
-        and node.op == "/"
     ):
+
         return left
 
     # x * 0
-    if (
-        (
+    if node.op == "*":
+
+        if (
             left.is_leaf()
             and left.value == 0
-        )
-        or
-        (
+        ):
+
+            return Node(value=0)
+
+        if (
             right.is_leaf()
             and right.value == 0
-        )
-    ):
+        ):
 
-        if node.op == "*":
-
-            return Node(
-                value=0
-            )
+            return Node(value=0)
 
     # x ^ 1
     if (
@@ -888,7 +1118,17 @@ def simplify(node):
         and right.is_leaf()
         and right.value == 1
     ):
+
         return left
+
+    # x ^ 0 = 1
+    if (
+        node.op == "^"
+        and right.is_leaf()
+        and right.value == 0
+    ):
+
+        return Node(value=1)
 
     return Node(
         op=node.op,
@@ -907,14 +1147,24 @@ def score_expression(
     target
 ):
 
+    if expression is None:
+
+        return float("inf")
+
     total_error = 0.0
     valid = 0
 
     for row in dataset:
 
-        prediction = expression.evaluate(
-            row
-        )
+        try:
+
+            prediction = expression.evaluate(
+                row
+            )
+
+        except Exception:
+
+            prediction = None
 
         if prediction is None:
             continue
@@ -1063,6 +1313,7 @@ def discover(
             if score < best_score:
 
                 best_score = score
+
                 best_expression = (
                     expression.clone()
                 )
@@ -1072,6 +1323,23 @@ def discover(
             else:
 
                 stagnant_generations += 1
+
+        # ----------------------------------------------------
+        # Safety fallback
+        # ----------------------------------------------------
+
+        if best_expression is None:
+
+            best_expression = random_expression(
+                grammar,
+                max_depth=3
+            )
+
+            best_score = score_expression(
+                best_expression,
+                train,
+                target
+            )
 
         # ----------------------------------------------------
         # Sort
@@ -1133,10 +1401,7 @@ def discover(
 
         if stagnant_generations > 75:
 
-            if (
-                grammar.growth_level
-                < 6
-            ):
+            if grammar.growth_level < 6:
 
                 grammar.grow()
 
@@ -1155,6 +1420,17 @@ def discover(
             in scored[:100]
         ]
 
+        # Safety
+        if not pool:
+
+            pool = [
+                random_expression(
+                    grammar,
+                    max_depth=3
+                )
+                for _ in range(20)
+            ]
+
         while len(
             new_population
         ) < population_size:
@@ -1163,7 +1439,10 @@ def discover(
                 pool
             )
 
+            # ------------------------------------------------
             # Crossover
+            # ------------------------------------------------
+
             if random.random() < 0.35:
 
                 parent_b = random.choice(
@@ -1179,20 +1458,45 @@ def discover(
 
                 child = parent_a.clone()
 
+            # ------------------------------------------------
+            # If crossover somehow produces None
+            # ------------------------------------------------
+
+            if child is None:
+
+                child = random_expression(
+                    grammar,
+                    max_depth=3
+                )
+
+            # ------------------------------------------------
             # Mutation
+            # ------------------------------------------------
+
             child = mutate(
                 child,
                 grammar,
                 probability=0.35
             )
 
+            # ------------------------------------------------
             # Simplify
+            # ------------------------------------------------
+
             child = simplify(
                 child
             )
 
+            # ------------------------------------------------
             # Reject absurd trees
+            # ------------------------------------------------
+
             if child.size() > 35:
+
+                continue
+
+            if child.depth() > 15:
+
                 continue
 
             new_population.append(
@@ -1234,11 +1538,13 @@ def report(
     print("=" * 70)
 
     print()
+
     print(
         f"{target} = {expression}"
     )
 
     print()
+
     print(
         f"Training error : "
         f"{train_error:.12f}"
@@ -1270,12 +1576,15 @@ def main():
 
     print()
     print("=" * 70)
+
     print(
         "        PHYDISCOVER V2"
     )
+
     print(
         "     SELF-GROWING PHYSICS AI"
     )
+
     print("=" * 70)
 
     data = make_data()
@@ -1368,9 +1677,11 @@ def main():
 
     print()
     print("=" * 70)
+
     print(
         "              DISCOVERY ARCHIVE"
     )
+
     print("=" * 70)
 
     for target, result in discoveries.items():
@@ -1382,6 +1693,7 @@ def main():
         )
 
     print()
+
     print(
         "Search complete."
     )
@@ -1392,4 +1704,5 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     main()
