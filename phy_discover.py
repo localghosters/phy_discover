@@ -14,11 +14,18 @@ variables (single-index search), learns exponents back into its vocabulary,
 falsifies its own hypotheses on fresh far-range measurements, and invents latent
 per-experiment variables.
 
-Usage:
-    python phy_discover.py                          # autonomous agent, all challenges
-    python phy_discover.py --challenge composite    # one autonomous challenge
-    python phy_discover.py --mode data --challenge law1
-    python phy_discover.py --mode data --csv exp1.csv exp2.csv
+Python:
+    from phy_discover import discover, explore
+    res = discover("data.csv", experiment="run_id");  print(res.summary());  res.save("report.md")
+    res = explore(knobs, measure)                    # autonomous agent on an instrument
+
+Command line:
+    python phy_discover.py --csv a.csv b.csv --out report.md      # your data
+    python phy_discover.py --csv all.csv --experiment-col run_id
+    python phy_discover.py --lab-template > my_lab.py             # describe an instrument
+    python phy_discover.py --lab my_lab.py --out report.md        # agent runs it
+    python phy_discover.py                                        # built-in benchmarks
+    python phy_discover.py --mode data --challenge law2           # V4-style benchmark
 
 Requires: numpy only.
 """
@@ -139,7 +146,7 @@ def snap_const(value, se_rel):
 
     for inv in (False, True):
         x = 1.0 / v if inv else v
-        extra = 0.7 if inv else 0.0
+        extra = 1.2 if inv else 0.0
         for d in range(1, 6):
             s = float(f"{x:.{d - 1}e}")
             if s > 0:
@@ -192,7 +199,7 @@ def exp_complexity(e):
 def _simple_cost(q):
     for den in (1, 2, 3, 4):
         v = round(q * den) / den
-        if abs(v - q) < 0.04:
+        if abs(v - q) < 0.02:
             return exp_complexity(v)
     return 3.5
 
@@ -202,10 +209,13 @@ def _simple_cost(q):
 #    A relation is   lhs = sum_k coef_k * feature_k    (implicit form F = 0)
 # =============================================================================
 class Feature:
-    __slots__ = ("kind", "exps", "var")
+    """kind 'm'  : monomial  prod v^e
+       kind 'log': log(v)
+       kind 'em' : monomial * exp(sum q * v^k)   (exponential growth/decay, Arrhenius, Gaussian)"""
+    __slots__ = ("kind", "exps", "var", "ex")
 
-    def __init__(self, kind, exps=None, var=None):
-        self.kind, self.exps, self.var = kind, exps or {}, var
+    def __init__(self, kind, exps=None, var=None, ex=None):
+        self.kind, self.exps, self.var, self.ex = kind, exps or {}, var, ex or {}
 
     @staticmethod
     def mono(exps):
@@ -215,36 +225,78 @@ class Feature:
     def log(var):
         return Feature("log", var=var)
 
+    @staticmethod
+    def em(exps, ex):
+        norm = {}
+        for key, val in ex.items():            # accepts {(v, k): q} or {v: (k, q)}
+            (v, k), q = (key, val) if isinstance(key, tuple) else ((key, val[0]), val[1])
+            norm[(v, int(k))] = float(q)
+        ex = {key: q for key, q in norm.items() if abs(q) > 1e-12}
+        if not ex:
+            return Feature.mono(exps)
+        return Feature("em", {v: float(e) for v, e in exps.items() if abs(e) > 1e-12}, None, ex)
+
     def key(self):
         if self.kind == "m":
             return tuple(sorted((v, round(e, 3)) for v, e in self.exps.items()))
+        if self.kind == "em":
+            return tuple(sorted((v, round(e, 3)) for v, e in self.exps.items())) + \
+                tuple(sorted((f"exp:{v}^{k}", round(q, 4)) for (v, k), q in self.ex.items()))
         return ((f"log({self.var})", 1.0),)
 
     def vec(self):
-        return dict(self.exps) if self.kind == "m" else {"log:" + self.var: 1.0}
+        if self.kind == "m":
+            return dict(self.exps)
+        if self.kind == "em":
+            d = dict(self.exps)
+            for (v, k), q in self.ex.items():
+                d[f"exp:{v}^{k}"] = q
+            return d
+        return {"log:" + self.var: 1.0}
 
     def vars(self):
-        return set(self.exps) if self.kind == "m" else {self.var}
+        if self.kind == "m":
+            return set(self.exps)
+        if self.kind == "em":
+            return set(self.exps) | {v for v, _ in self.ex}
+        return {self.var}
 
     def eval(self, cols):
         n = _nrows(cols)
         with np.errstate(all="ignore"):
-            if self.kind == "m":
+            if self.kind in ("m", "em"):
                 out = np.ones(n)
                 for v, e in self.exps.items():
                     out = out * (cols[v] if e == 1.0 else np.power(cols[v], e))
+                if self.kind == "em":
+                    arg = np.zeros(n)
+                    for (v, k), q in self.ex.items():
+                        arg = arg + q * (cols[v] if k == 1 else np.power(cols[v], k))
+                    out = out * np.exp(np.clip(arg, -700, 700))
                 return out
             return np.log(cols[self.var])
 
     def complexity(self):
         if self.kind == "log":
             return 3.0
-        return 1.0 + sum(exp_complexity(e) for e in self.exps.values())
+        base = 1.0 + sum(exp_complexity(e) for e in self.exps.values())
+        return base + 2.0 * len(self.ex)
 
     def text(self):
         if self.kind == "log":
             return f"log({self.var})"
-        return mono_text(self.exps)
+        base = mono_text(self.exps) if self.exps else ""
+        if self.kind == "m":
+            return base or "1"
+        facs = []
+        for (v, k), q in sorted(self.ex.items()):
+            if k == 1:
+                facs.append(f"exp({fmt(q)}*{v})")
+            elif k == -1:
+                facs.append(f"exp({fmt(q)}/{v})")
+            else:
+                facs.append(f"exp({fmt(q)}*{v}^2)")
+        return "*".join(([base] if base else []) + facs)
 
 
 def _pow(v, e):
@@ -533,9 +585,11 @@ def dim_status(rel, bundle):
 
     def dv(f):
         vec = np.zeros(nb)
-        if f.kind == "m":
+        if f.kind in ("m", "em"):
             for v, e in f.exps.items():
                 vec += e * np.array(dims[v], float)
+            if f.kind == "em" and any(np.any(np.array(dims[v]) != 0) for v, _ in f.ex):
+                return None
         elif np.any(np.array(dims[f.var]) != 0):
             return None
         return vec
@@ -628,6 +682,10 @@ class PowerLawFinder:
                             1.2533 * max(mad_sigma(res[m]), 1e-9) / math.sqrt(m.sum())))
         return c, se, per
 
+    def const_only(self, lhs, q, mask):
+        y = self.logs[lhs] - sum(q[v] * self.logs[v] for v in q)
+        return float(np.median(y[mask]))
+
     def refine(self, cand):
         sub, p, mask, X = cand["sub"], cand["p"], cand["mask"], cand["X"]
         tr = self.b.train
@@ -673,7 +731,7 @@ class PowerLawFinder:
         committee = []
         for row in QB[: self.cfg.committee]:
             qb = dict(zip(rest, row))
-            cb, _, _ = self.fit_const(lhs, qb, mask)
+            cb = self.const_only(lhs, qb, mask)
             committee.append(Relation(lhs_f, [(math.exp(cb), Feature.mono(qb))]))
         used_snap = q is qs
         exp_info = [f"exponent {v}: {fmt(q[v])} "
@@ -769,6 +827,22 @@ def beam_search(Phi, t, kmax, beam):
         cur = sorted(((r, T) for T, r in cand.items()))[:beam]
         models[k] = cur[0]
     return models
+
+
+def boot_lstsq(A, t, idx, B, rng):
+    """Bootstrap least squares via multinomial row weights on the Gram matrix
+    (no fancy-indexing copies of the big matrix)."""
+    Ai, ti = A[idx], t[idx]
+    n, k = Ai.shape
+    out = []
+    for _ in range(B):
+        w = np.bincount(rng.integers(0, n, n), minlength=n).astype(float)
+        G = Ai.T @ (Ai * w[:, None])
+        try:
+            out.append(np.linalg.solve(G + 1e-12 * np.eye(k), Ai.T @ (ti * w)))
+        except np.linalg.LinAlgError:
+            continue
+    return np.array(out)
 
 
 class ImplicitFinder:
@@ -870,14 +944,9 @@ class ImplicitFinder:
             return c, mask
 
         def boot(S, mask):
-            idx = np.where(mask)[0]
-            C = []
-            for _ in range(cfg.n_boot):
-                rows = self.rng.choice(idx, size=len(idx))
-                A = Phi[rows][:, S]
-                sc = np.linalg.norm(A, axis=0)
-                C.append(np.linalg.lstsq(A / sc, t[rows], rcond=None)[0] / sc)
-            C = np.array(C)
+            A = Phi[:, S]
+            sc = np.linalg.norm(A[mask], axis=0)
+            C = boot_lstsq(A / sc, t, np.where(mask)[0], cfg.n_boot, self.rng) / sc
             return C.std(0), C
 
         while True:
@@ -908,9 +977,10 @@ class ImplicitFinder:
         params = [f"coef of {f.text()}: {i.describe()}" for f, i in zip(fs, infos)]
         return rel, float(np.max(se / np.abs(c))), params, committee
 
-    def run(self):
+    def run(self, lhs_vars=None):
         out = []
-        lhs_list = [Feature.mono({})] + [Feature.mono({v: 1}) for v in self.basis]
+        lhs_list = ([Feature.mono({v: 1}) for v in lhs_vars] if lhs_vars is not None
+                    else [Feature.mono({})] + [Feature.mono({v: 1}) for v in self.basis])
         capped = Config(**{**self.cfg.__dict__, "accept_err": self.err_cap})
         for lhs in lhs_list:
             # Occam order: a model that does not use the quantity it predicts is
@@ -934,6 +1004,167 @@ class ImplicitFinder:
             st, rel, spread, params, committee = best
             if accept(st, capped):
                 out.append(Entry(rel, "implicit", st, spread, params, committee))
+        return out
+
+
+# =============================================================================
+# 9b. SEMI-LOG FINDER   y = C * prod v^p * exp(sum q * v^k),  k in {1, -1, 2}
+#     Exponential growth/decay, Arrhenius rates, Gaussians. Sparse regression of
+#     log y on {log v, v, 1/v, v^2}; an exponential factor must beat the best
+#     pure power law by 2x to be accepted.
+# =============================================================================
+KIND_K = {"lin": 1, "inv": -1, "sq": 2}
+
+
+class SemiLogFinder:
+    def __init__(self, bundle, cfg, targets, loggable, varying):
+        self.b, self.cfg = bundle, cfg
+        self.rng = np.random.default_rng(cfg.seed + 3)
+        tr = bundle.train
+        self.targets = [t for t in targets if t in loggable]
+        self.cols, raw = [], []
+        for v in bundle.variables:
+            if v not in varying:
+                continue
+            a = tr.cols[v]
+            opts = [("lin", a), ("sq", a ** 2)]
+            if v in loggable:
+                opts = [("log", np.log(a)), ("inv", 1.0 / a)] + opts
+            for kind, arr in opts:
+                self.cols.append((v, kind))
+                raw.append(arr)
+        self.raw = np.column_stack(raw) if raw else np.zeros((tr.n, 0))
+        self.cent = self._center(self.raw)
+        self.ylog = {t: np.log(tr.cols[t]) for t in self.targets}
+        self.ycent = {t: self._center(self.ylog[t][:, None])[:, 0] for t in self.targets}
+
+    def _center(self, M):
+        out = M.copy()
+        tr = self.b.train
+        for e in range(tr.n_exp):
+            m = tr.exp_id == e
+            if m.any():
+                out[m] -= out[m].mean(axis=0)
+        return out
+
+    def _select(self, Xn, y):
+        cfg = self.cfg
+        K = cfg.max_terms
+        m1 = beam_search(Xn, y, K, cfg.beam)
+        S = list(m1[max(m1)][1])
+        c = np.linalg.lstsq(Xn[:, S], y, rcond=None)[0]
+        inl = trim_mask(y - Xn[:, S] @ c, cfg.trim_k)
+        n2, L = int(inl.sum()), Xn.shape[1]
+        m2 = beam_search(Xn[inl], y[inl], K, cfg.beam)
+        bic = {k: n2 * math.log(max(r, 0) / n2 + 1e-12) + k * (math.log(n2) + 2 * math.log(L))
+               for k, (r, _) in m2.items()}
+        return list(m2[min(bic, key=bic.get)][1])
+
+    def _fit_model(self, t, eligible):
+        cfg = self.cfg
+        if len(eligible) < 2:
+            return None
+        y = self.ycent[t]
+        X = self.cent[:, eligible]
+        nrm = np.linalg.norm(X, axis=0)
+        nrm[nrm < 1e-12] = 1e12
+        Xn = X / nrm
+        S = self._select(Xn, y)
+        while True:
+            mask = np.ones(len(y), bool)
+            for _ in range(5):
+                c = np.linalg.lstsq(Xn[mask][:, S], y[mask], rcond=None)[0]
+                new = trim_mask(y - Xn[:, S] @ c, cfg.trim_k)
+                if (new == mask).all():
+                    break
+                mask = new
+            C = boot_lstsq(Xn[:, S], y, np.where(mask)[0], cfg.n_boot, self.rng)
+            se = C.std(0)
+            tst = np.abs(c) / np.maximum(se, 1e-15)
+            if tst.min() < 6:
+                if len(S) == 1:
+                    return None
+                S.pop(int(np.argmin(tst)))
+                continue
+            break
+        cols = [eligible[j] for j in S]
+        return cols, c / nrm[S], se / nrm[S], C / nrm[S], mask
+
+    def _build(self, t, cols, beta, mask):
+        exps, ex = {}, {}
+        for j, b in zip(cols, beta):
+            v, kind = self.cols[j]
+            if kind == "log":
+                exps[v] = exps.get(v, 0) + b
+            else:
+                ex[(v, KIND_K[kind])] = b
+        pred = self.raw[:, cols] @ np.asarray(beta)
+        c = float(np.median((self.ylog[t] - pred)[mask]))
+        f = Feature.em(exps, ex)
+        return Relation(Feature.mono({t: 1}), [(math.exp(c), f)]), c
+
+    def _fit_target(self, t, eligible):
+        res = self._fit_model(t, eligible)
+        if res is None:
+            return None
+        cols, beta, se, C, mask = res
+        tr = self.b.train
+        rel, c = self._build(t, cols, beta, mask)
+        if rel is None:
+            return None
+        err_free = median_err(rel, tr)
+        beta_s, info = list(beta), [None] * len(beta)
+        for j in np.argsort(-np.abs(beta)):
+            kind = self.cols[cols[j]][1]
+            if kind == "log":
+                val, ok = snap_exponent(beta[j], se[j])
+            else:
+                ci = snap_const(beta[j], se[j] / abs(beta[j]))
+                val, ok = ci.value, ci.origin != "fitted"
+            trial = list(beta_s)
+            trial[j] = val
+            r2, _ = self._build(t, cols, trial, mask)
+            if r2 is not None and median_err(r2, tr) <= err_free * 1.25 + 3e-4:
+                beta_s = trial
+                info[j] = "snapped" if ok else "fitted"
+            else:
+                info[j] = "fitted"
+        rel, c = self._build(t, cols, beta_s, mask)
+        if rel is None:
+            return None
+        res_c = (self.ylog[t] - self.raw[:, cols] @ np.asarray(beta_s) - c)[mask]
+        se_c = 1.2533 * max(mad_sigma(res_c), 1e-9) / math.sqrt(mask.sum())
+        ci = snap_const(math.exp(c), se_c)
+        rel = Relation(rel.lhs, [(ci.value, rel.rhs[0][1])], [ci])
+        params = []
+        for j, bj, sj, ij in zip(cols, beta_s, se, info):
+            v, kind = self.cols[j]
+            what = f"exponent of {v}" if kind == "log" else f"rate in exp({v}^{KIND_K[kind]})"
+            params.append(f"{what}: {fmt(bj)} [{ij}, +- {sj:.2g}]")
+        params.append(f"constant {ci.describe()}")
+        committee = []
+        for row in C[: self.cfg.committee]:
+            r2, _ = self._build(t, cols, list(row), mask)
+            if r2 is not None:
+                committee.append(r2)
+        rel_spread = max([sj if self.cols[j][1] == "log" else sj / max(abs(bj), 1e-12)
+                          for j, bj, sj in zip(cols, beta_s, se)] + [se_c])
+        return rel, rel_spread, params, committee
+
+    def run(self):
+        out = []
+        for t in self.targets:
+            elig_all = [j for j, (v, k) in enumerate(self.cols) if v != t]
+            elig_log = [j for j in elig_all if self.cols[j][1] == "log"]
+            semi = self._fit_target(t, elig_all)
+            if semi is None or semi[0].rhs[0][1].kind != "em":
+                continue
+            st = evaluate_relation(semi[0], self.b)
+            pure = self._fit_target(t, elig_log)
+            err_p = median_err(pure[0], self.b.train) if pure else float("inf")
+            if st["train"] < 0.5 * err_p and accept(st, self.cfg):
+                rel, spread, params, committee = semi
+                out.append(Entry(rel, "semilog", st, spread, params, committee))
         return out
 
 
@@ -1056,8 +1287,19 @@ class Discoverer:
         pl = PowerLawFinder(b, cfg, loggable)
         pool = pl.run()
         self.hints = pl.hints
+        targets = [o for o in b.outputs if o in loggable] or sorted(loggable)
+        say(cfg, "\n[SEMI-LOG LAWS] exponential / Arrhenius / Gaussian dependence")
+        pool += SemiLogFinder(b, cfg, targets, loggable, set(varying)).run()
+        # Per-variable noise floor: a relation far worse than the best law that
+        # involves the same variables is an approximation of a true law, not a law.
+        floor = {}
+        for e in pool:
+            for v in e.rel.variables():
+                floor[v] = min(floor.get(v, 1e9), e.stats["train"])
+        pool = [e for e in pool
+                if e.stats["train"] <= max(3 * max(floor[v] for v in e.rel.variables()), 0.004)]
         pool.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
-        say(cfg, f"  {len(pool)} accepted candidates")
+        say(cfg, f"  {len(pool)} accepted candidates (power-law + semi-log)")
         for e in pool:
             self.archive.classify(e)
 
@@ -1082,6 +1324,25 @@ class Discoverer:
         say(cfg, f"  {len(pool2)} accepted candidates")
         for e in pool2:
             self.archive.classify(e)
+
+        # chained search: a reading may be built from OTHER readings (heat from rate and
+        # a knob). Basis reduction hid those, so retry unexplained readings with
+        # every variable available as a building block.
+        seen = set()
+        for e in self.archive.entries:
+            if e.cls != "DEFINITION":
+                seen |= e.rel.variables()
+        missing = [o for o in (b.outputs or varying) if o in varying and o not in seen]
+        if missing and eliminated:
+            say(cfg, f"\n[CHAINED SEARCH] still unexplained: {missing}; retrying with all "
+                     f"variables (including already-explained readings) as building blocks")
+            imp2 = ImplicitFinder(b, cfg, list(varying), cap, self.extra_exps)
+            pool3 = imp2.run(lhs_vars=missing)
+            pool3.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
+            say(cfg, f"  {len(pool3)} accepted candidates")
+            for e in pool3:
+                e.source = "implicit (chained)"
+                self.archive.classify(e)
 
         for e in self.archive.all:
             if e.cls == "DEFINITION":
@@ -1707,6 +1968,24 @@ def make_lab(name, rng):
                 [("Y = 30 + 3*log(x*y/z^2)",
                   [M(1, Y=1), M(-30), (-3, Feature.log("x")), (-3, Feature.log("y")),
                    (6, Feature.log("z"))])])
+    if name == "decay":
+        return (Lab({"x": (0.2, 12), "y": (0.5, 15), "z": (0.5, 10)},
+                    wrap({"Y": lambda p: 5.0 * np.exp(-0.35 * p["x"]) * p["z"] ** 1.5})),
+                [("Y = 5*z^1.5*exp(-0.35*x)",
+                  [(1, Feature.mono({"Y": 1})),
+                   (-5, Feature.em({"z": 1.5}, {"x": (1, -0.35)}))])])
+    if name == "arrhenius":
+        return (Lab({"T": (250, 600), "c": (0.1, 5)},
+                    wrap({"R": lambda p: 3.0e4 * p["c"] ** 2 * np.exp(-2500.0 / p["T"])})),
+                [("R = 30000*c^2*exp(-2500/T)",
+                  [(1, Feature.mono({"R": 1})),
+                   (-3.0e4, Feature.em({"c": 2}, {"T": (-1, -2500.0)}))])])
+    if name == "peak":
+        return (Lab({"x": (0.2, 8), "z": (0.5, 10)},
+                    wrap({"G": lambda p: 2.0 * np.exp(-(p["x"] - 3) ** 2 / 4)})),
+                [("G = 2*exp(-(x-3)^2/4)",
+                  [(1, Feature.mono({"G": 1})),
+                   (-2 * math.exp(-2.25), Feature.em({}, {("x", 1): 1.5, ("x", 2): -0.25}))])])
     if name == "law1":
         return (Lab(knobs, wrap({"Y": lambda p: 4.7 * p["x"] ** 1.83 * p["z"]})),
                 [("Y = 4.7*x^1.83*z", [M(1, Y=1), M(-4.7, x=1.83, z=1)])])
@@ -1732,7 +2011,7 @@ def make_lab(name, rng):
     raise KeyError(name)
 
 
-CHALLENGES = ["law1", "law3", "suite", "pendulum", "composite", "logindex"]
+CHALLENGES = ["law1", "law3", "suite", "pendulum", "composite", "logindex", "decay", "arrhenius", "peak"]
 
 
 def run_challenge(name, cfg, seed):
@@ -1787,37 +2066,311 @@ def run_latent(cfg, seed):
 
 
 
+# #############################################################################
+# PART 3: PUBLIC API, FILE HANDLING, EXPORT, CLI
+# #############################################################################
+import csv
+import importlib.util
+import json
+import os
+
+
+def _read_csv_table(path):
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"{path}: no data rows")
+    cols = {}
+    for k in rows[0]:
+        vals = [(r.get(k) or "").strip() for r in rows]
+        parsed, bad = [], 0
+        for v in vals:
+            try:
+                parsed.append(float(v) if v else np.nan)
+            except ValueError:
+                parsed.append(np.nan)
+                bad += 1
+        filled = sum(1 for v in vals if v)
+        # numeric if >=80% of the filled cells parse (stray "n/a" cells become missing)
+        if filled and bad <= 0.2 * filled:
+            cols[k.strip()] = np.array(parsed)
+        else:
+            cols[k.strip()] = np.array(vals, dtype=object)
+    return cols
+
+
+def _table_from(obj):
+    if isinstance(obj, str):
+        return _read_csv_table(obj)
+    if hasattr(obj, "to_dict") and hasattr(obj, "columns"):          # pandas DataFrame
+        return {str(k): np.asarray(v) for k, v in obj.to_dict("list").items()}
+    return {str(k): np.asarray(v) for k, v in dict(obj).items()}
+
+
+def _clean(cols, name, min_rows=30):
+    """Keep numeric columns that are mostly present; drop rows with missing/inf values."""
+    num = {k: np.asarray(v, float) for k, v in cols.items() if np.asarray(v).dtype != object}
+    if not num:
+        raise ValueError(f"{name}: no numeric columns")
+    n = len(next(iter(num.values())))
+    keep = {k: v for k, v in num.items() if np.isfinite(v).mean() > 0.5}
+    ok = np.ones(n, bool)
+    for v in keep.values():
+        ok &= np.isfinite(v)
+    if ok.sum() < min_rows:
+        raise ValueError(f"{name}: only {int(ok.sum())} usable rows (need >= {min_rows})")
+    return {k: v[ok] for k, v in keep.items()}, int(n - ok.sum())
+
+
+def to_experiments(data, experiment=None):
+    """data: CSV path | list of CSV paths (one experiment each) | dict of arrays |
+    DataFrame | list of dicts. `experiment`: column naming which experiment each row is in."""
+    items = data if isinstance(data, (list, tuple)) else [data]
+    exps, notes = [], []
+    for idx, item in enumerate(items):
+        table = _table_from(item)
+        label = item if isinstance(item, str) else f"experiment{idx + 1}"
+        ignored = [k for k, v in table.items() if np.asarray(v).dtype == object and k != experiment]
+        if ignored:
+            notes.append(f"{label}: ignored non-numeric column(s) {ignored}")
+        if experiment and experiment in table:
+            tags = np.asarray(table.pop(experiment))
+            for tag in dict.fromkeys(tags.tolist()):
+                m = tags == tag
+                cols, dropped = _clean({k: np.asarray(v)[m] for k, v in table.items()}, f"{label}[{tag}]")
+                exps.append(Experiment(f"{tag}", cols))
+                if dropped:
+                    notes.append(f"{label}[{tag}]: dropped {dropped} rows with missing values")
+        else:
+            cols, dropped = _clean(table, label)
+            exps.append(Experiment(os.path.basename(label) if isinstance(item, str) else label, cols))
+            if dropped:
+                notes.append(f"{label}: dropped {dropped} rows with missing values")
+    common = [k for k in exps[0].cols if all(k in e.cols for e in exps)]
+    if len(common) < 2:
+        raise ValueError("experiments share fewer than 2 numeric columns")
+    exps = [Experiment(e.name, {k: e.cols[k] for k in common}) for e in exps]
+    return exps, notes
+
+
+class Result:
+    """What `discover()` returns."""
+
+    def __init__(self, engine, bundle, derived=(), notes=()):
+        self.engine, self.bundle, self.derived, self.notes = engine, bundle, list(derived), list(notes)
+
+    @property
+    def entries(self):
+        return self.engine.archive.ranked()
+
+    def counts(self):
+        return {c: sum(1 for e in self.engine.archive.all if e.cls == c)
+                for c in ("NOVEL", "DERIVED", "KNOWN", "REDUNDANT")}
+
+    def summary(self):
+        n_exp = self.bundle.full.n_exp
+        lines = [f"{len(self.entries)} independent relationship(s) found "
+                 f"({self.counts()['REDUNDANT']} equivalent restatements collapsed), "
+                 f"{n_exp} experiment(s), {self.bundle.full.n} rows."]
+        for d in self.derived:
+            lines.append(f"invented variable: {d.text()}")
+        for i, e in enumerate(self.entries, 1):
+            st = e.stats
+            lines.append(f"{i}. {e.rel.text()}    [{e.cls}; median error {st['test']:.2%} on held-out "
+                         f"data; worst experiment {st['max_exp']:.2%}; interestingness "
+                         f"{e.scores['interestingness']:.2f}"
+                         + (f"; dimensions {e.dim}" if e.dim != "n/a" else "") + "]")
+        lines += [f"note: {n}" for n in self.notes]
+        return "\n".join(lines)
+
+    def to_dict(self):
+        out = []
+        for e in self.entries:
+            out.append(dict(
+                relation=e.rel.text(), implicit_form=e.rel.implicit_text(), cls=e.cls,
+                source=e.source, complexity=round(e.rel.complexity(), 2),
+                scores={k: round(float(v), 4) for k, v in e.scores.items()},
+                error=dict(train=e.stats["train"], val=e.stats["val"], test=e.stats["test"],
+                           per_experiment=[float(x) for x in e.stats["per_exp"]]),
+                dimensions=e.dim, parameters=list(e.params),
+                constants=[c.describe() for c in e.rel.cinfo if c is not None],
+                equivalent_forms=list(e.aliases)))
+        return dict(counts=self.counts(), experiments=self.bundle.full.n_exp,
+                    rows=int(self.bundle.full.n),
+                    invented_variables=[d.text() for d in self.derived],
+                    notes=self.notes, relations=out)
+
+    def to_markdown(self):
+        L = ["# Discovery report", "", self.summary().split("\n")[0], ""]
+        if self.derived:
+            L += ["**Invented variables**", ""] + [f"- `{d.text()}`" for d in self.derived] + [""]
+        L += ["| # | Relation | Class | Test error | Worst experiment | Complexity | Interestingness |",
+              "|---|---|---|---|---|---|---|"]
+        for i, e in enumerate(self.entries, 1):
+            L.append(f"| {i} | `{e.rel.text()}` | {e.cls} | {e.stats['test']:.3%} | "
+                     f"{e.stats['max_exp']:.3%} | {e.rel.complexity():.1f} | "
+                     f"{e.scores['interestingness']:.2f} |")
+        L.append("")
+        for i, e in enumerate(self.entries, 1):
+            L += [f"## {i}. `{e.rel.text()}`", "",
+                  f"- implicit form: `{e.rel.implicit_text()}`", f"- found by: {e.source}"]
+            L += [f"- {p}" for p in e.params]
+            L += [f"- constant: {c.describe()}" for c in e.rel.cinfo if c is not None and e.source == "power-law"]
+            sc = e.scores
+            L += [f"- scores: accuracy {sc['accuracy']:.2f}, simplicity {sc['simplicity']:.2f}, "
+                  f"generality {sc['generality']:.2f}, robustness {sc['robustness']:.2f}, "
+                  f"novelty {sc['novelty']:.2f}",
+                  f"- median relative error: train {e.stats['train']:.4f}, val {e.stats['val']:.4f}, "
+                  f"test {e.stats['test']:.4f}; per experiment "
+                  f"{[round(float(x), 4) for x in e.stats['per_exp']]}"]
+            if e.dim != "n/a":
+                L.append(f"- dimensions: {e.dim}")
+            if e.aliases:
+                L.append(f"- equivalent forms collapsed: {len(e.aliases)}, e.g. `{e.aliases[0]}`")
+            L.append("")
+        return "\n".join(L)
+
+    def save(self, path):
+        with open(path, "w") as f:
+            f.write(json.dumps(self.to_dict(), indent=2) if path.endswith(".json")
+                    else self.to_markdown())
+        return path
+
+    def report(self, top=20):
+        self.engine.report(top=top)
+
+
+def discover(data, experiment=None, outputs=None, dims=None, base_dims=None, known=(),
+             seed=42, verbose=False, priors=False, **config):
+    """Find relationships in observations.
+
+        res = discover("run1.csv")                              # one experiment
+        res = discover(["a.csv", "b.csv", "c.csv"])             # several experiments
+        res = discover("all.csv", experiment="run_id")          # experiment column
+        res = discover(df, outputs=["T"], dims={"L": (0,1,0), ...}, base_dims=["M","L","T"])
+        print(res.summary());  res.save("report.md");  res.save("report.json")
+
+    `outputs`: readings you want on the left-hand side (display preference only).
+    `priors`: allow recognising pi, e, ... (default: constants are learned from data only).
+    """
+    PRIORS["named"] = PRIORS["grammar"] = bool(priors)
+    cfg = Config(seed=seed, verbose=verbose, **config)
+    exps, notes = to_experiments(data, experiment)
+    bundle = DataBundle(exps, cfg, dims, base_dims, outputs)
+    eng = Discoverer(bundle, cfg, known, "data")
+    eng.run()
+    return Result(eng, bundle, notes=notes)
+
+
+def explore(knobs, measure, seed=42, max_rounds=4, n0=200, priors=False, verbose=False):
+    """Autonomous discovery on a real or simulated instrument.
+
+        knobs   = {"temperature": (250, 600), "concentration": (0.1, 5)}   # name: (min, max), > 0
+        def measure(points): ...   # dict name->array of settings; return dict name->array of readings
+        res = explore(knobs, measure)
+
+    The agent chooses every setting itself, invents variables, falsifies its own
+    hypotheses with out-of-range measurements, and stops when nothing changes."""
+    PRIORS["named"] = PRIORS["grammar"] = bool(priors)
+    rng = np.random.default_rng(seed)
+
+    def fn(p):
+        out = {k: np.asarray(v, float) for k, v in measure(dict(p)).items()}
+        return {**{k: np.asarray(v, float) for k, v in p.items()}, **out}
+
+    lab = Lab(knobs, fn)
+    agent = Agent(lab, Config(seed=seed, verbose=verbose), rng, n0=n0, max_rounds=max_rounds)
+    eng = agent.run()
+    res = Result(eng, agent.bundle, agent.derived,
+                 [f"{lab.count} lab measurements used"])
+    res.agent = agent
+    return res
+
+
+LAB_TEMPLATE = '''# my_lab.py  -  describe your instrument; the agent does the rest.
+import numpy as np
+
+KNOBS = {                      # settings the agent may choose: name: (min, max). All > 0.
+    "temperature":   (250.0, 600.0),
+    "concentration": (0.1, 5.0),
+}
+
+def measure(points):
+    """points: dict name -> numpy array (one entry per requested measurement).
+    Run your experiment at each setting and return a dict of numpy arrays, one per
+    quantity you read out (e.g. {"rate": ..., "yield": ...}). Knobs are added for you."""
+    T, c = points["temperature"], points["concentration"]
+    rate = np.zeros_like(T)    # <- replace with a call to your hardware / simulator
+    return {"rate": rate}
+'''
+
+
+def _load_lab(path):
+    spec = importlib.util.spec_from_file_location("user_lab", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.KNOBS, mod.measure
+
+
 def main():
-    ap = argparse.ArgumentParser(description="PhyDiscover (V4 engine + V5 autonomous agent)")
-    ap.add_argument("--mode", choices=["agent", "data"], default="agent",
-                    help="agent: lab-driven autonomous discovery (V5). "
-                         "data: analyse supplied observations (V4 engine)")
+    ap = argparse.ArgumentParser(
+        description="phy_discover: find hidden relationships in data, or run an autonomous agent "
+                    "that designs its own experiments.")
+    ap.add_argument("--csv", nargs="+", help="analyse CSV data (one file = one experiment)")
+    ap.add_argument("--experiment-col", help="column naming the experiment of each row")
+    ap.add_argument("--outputs", nargs="+", help="readings to put on the left-hand side")
+    ap.add_argument("--dims", help="JSON file: {\"L\": [0,1,0], ..., \"_base\": [\"M\",\"L\",\"T\"]}")
+    ap.add_argument("--lab", help="python file defining KNOBS and measure(points): run the agent on it")
+    ap.add_argument("--lab-template", action="store_true", help="print a template lab file")
+    ap.add_argument("--out", help="save report to .md or .json")
+    ap.add_argument("--mode", choices=["agent", "data"], default=None,
+                    help="built-in benchmarks: agent (V5) or data (V4 engine)")
     ap.add_argument("--challenge", default="all",
-                    help="agent mode: law1 law3 suite pendulum composite logindex latent | all; "
-                         "data mode: law1 law2 law3 law4 suite pendulum | all")
-    ap.add_argument("--csv", nargs="+", help="data mode: your CSVs (one file = one experiment)")
-    ap.add_argument("--priors", action="store_true",
-                    help="allow built-in constant priors (pi, e, ...). Default in agent mode: off")
+                    help="benchmarks. agent: law1 law3 suite pendulum composite logindex decay "
+                         "arrhenius latent | all.  data: law1 law2 law3 law4 suite pendulum | all")
+    ap.add_argument("--priors", action="store_true", help="allow pi/e/... constant priors")
     ap.add_argument("--no-active", action="store_true")
+    ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
 
-    if a.mode == "data":
+    if a.lab_template:
+        print(LAB_TEMPLATE)
+        return
+    if a.csv:
+        dims = base = None
+        if a.dims:
+            raw = json.load(open(a.dims))
+            base = raw.pop("_base", None)
+            dims = {k: tuple(v) for k, v in raw.items()}
+        res = discover(a.csv, experiment=a.experiment_col, outputs=a.outputs, dims=dims,
+                       base_dims=base, seed=a.seed, verbose=a.verbose, priors=a.priors)
+        print(res.summary())
+        if a.verbose:
+            res.report()
+        if a.out:
+            print("saved", res.save(a.out))
+        return
+    if a.lab:
+        knobs, measure = _load_lab(a.lab)
+        res = explore(knobs, measure, seed=a.seed, max_rounds=a.rounds, priors=a.priors)
+        print("\n" + "=" * 78 + "\n" + res.summary())
+        if a.out:
+            print("saved", res.save(a.out))
+        return
+
+    # ---- built-in benchmarks ----
+    mode = a.mode or "agent"
+    if mode == "data":
         cfg = Config(seed=a.seed)
-        if a.csv:
-            eng = Discoverer(load_csv(a.csv, cfg), cfg, name="csv data")
-            eng.run()
-            eng.report()
-            return
         names = list(LAWS) if a.challenge == "all" else [a.challenge]
         for n in names:
             known = [Relation(Feature.mono({"A": 1}), [(2.75, Feature.mono({"x": 1, "y": 1}))])] \
                 if n == "suite" else ()
             run_hidden_law_challenge(LAWS[n], cfg, active=not a.no_active, known=known)
         return
-
-    PRIORS["named"] = a.priors
-    PRIORS["grammar"] = a.priors
+    PRIORS["named"] = PRIORS["grammar"] = a.priors
     cfg = Config(seed=a.seed)
     names = CHALLENGES + ["latent"] if a.challenge == "all" else [a.challenge]
     res = {}
