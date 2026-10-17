@@ -36,6 +36,40 @@ tests its own hypotheses on measurements 3x outside the explored range, designs 
 informative next measurements, and stops when nothing changes. `explore(knobs, measure)` is the
 Python equivalent.
 
+## Memory: it learns between runs
+
+Pass a JSON file and the engine reads it at the start and writes to it at the end.
+Nothing it has already worked out is rediscovered.
+
+```python
+res = discover("runs.csv", experiment="run_id", memory="phy_memory.json")
+res = explore(knobs, measure, memory="phy_memory.json")
+```
+```
+python phy_discover.py --csv runs.csv --experiment-col run_id      # default file: phy_memory.json
+python phy_discover.py --memory-show                               # laws, inventions, constants, notes
+python phy_discover.py --memory-demo composite                     # same task twice: ~300x faster
+```
+
+What it stores and what it does with it:
+
+| Memory | Used for |
+|---|---|
+| **laws** (with confirmed / failed counts) | re-validated on new data in milliseconds. If every reading is explained by a remembered law that still holds, the whole search is skipped; the agent also stops early once fresh out-of-range measurements confirm them |
+| **falsified** hypotheses | never trusted blindly again: a candidate matching one gets a warning and half the interestingness. Cleared automatically if the law later holds on new data |
+| **constants** seen in 2+ runs | reused when snapping, so the same constant is reported identically across datasets. Related constants are noted (`b = a^2`, ...) |
+| **exponents** seen in 2+ runs | added to the search vocabulary |
+| **inventions** (invented variables) | re-adopted after a one-line check instead of searched for again |
+| **stage statistics** | a search stage that has produced nothing in 8+ runs is only sampled every 5th run |
+| **notes** and **history** | the engine's own log: what it learned, what failed, lessons, hints about hidden variables |
+
+Safety: a remembered law is never trusted, only re-validated against the new data. If the world
+changes it fails validation, is counted against, and is retired after 3 failures (and fixed laws are
+re-learned). The file is written atomically; a corrupt file is moved aside and the run continues.
+Use `--domain NAME` (or `domain=`) to keep projects that reuse variable names apart, and
+`--memory-forget TEXT` / `--memory-reset` to edit or clear it. Memory is matched by variable
+**name**, so keep names consistent between runs.
+
 ## What it can find
 
 | Family | Example |
