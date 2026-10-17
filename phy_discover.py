@@ -9,6 +9,9 @@ invariants, sparse implicit laws, snapped constants, dimensionless groups,
 equivalence detection (KNOWN/DERIVED/REDUNDANT/NOVEL), interestingness scores,
 and active experiment design.
 
+Laws it can assemble: power laws, sparse sums/ratios/logs, exp/Arrhenius/Gaussian factors,
+and (damped) sin/cos of a measured input (frequency, decay, amplitude and phase are estimated).
+
 Memory: pass a JSON file (`memory="phy_memory.json"` / `--memory`) and the engine
 re-validates remembered laws instead of rediscovering them, reuses learned constants,
 exponents and invented variables, remembers falsified hypotheses, and keeps notes.
@@ -220,10 +223,17 @@ class Feature:
     """kind 'm'  : monomial  prod v^e
        kind 'log': log(v)
        kind 'em' : monomial * exp(sum q * v^k)   (exponential growth/decay, Arrhenius, Gaussian)"""
-    __slots__ = ("kind", "exps", "var", "ex")
+    __slots__ = ("kind", "exps", "var", "ex", "w", "fn")
 
-    def __init__(self, kind, exps=None, var=None, ex=None):
+    def __init__(self, kind, exps=None, var=None, ex=None, w=None, fn=None):
         self.kind, self.exps, self.var, self.ex = kind, exps or {}, var, ex or {}
+        self.w, self.fn = w, fn
+
+    @staticmethod
+    def trig(fn, var, w, decay=0.0):
+        """sin(w*var) or cos(w*var), optionally damped by exp(-decay*var)."""
+        ex = {(var, 1): -float(decay)} if decay and abs(decay) > 1e-12 else {}
+        return Feature("trig", var=var, w=float(w), fn=fn, ex=ex)
 
     @staticmethod
     def mono(exps):
@@ -250,6 +260,9 @@ class Feature:
         if self.kind == "em":
             return tuple(sorted((v, round(e, 3)) for v, e in self.exps.items())) + \
                 tuple(sorted((f"exp:{v}^{k}", round(q, 4)) for (v, k), q in self.ex.items()))
+        if self.kind == "trig":
+            return ((f"{self.fn}({self.var})", round(self.w, 4)),) + \
+                tuple(sorted((f"exp:{v}^{k}", round(q, 4)) for (v, k), q in self.ex.items()))
         return ((f"log({self.var})", 1.0),)
 
     def vec(self):
@@ -257,6 +270,11 @@ class Feature:
             return dict(self.exps)
         if self.kind == "em":
             d = dict(self.exps)
+            for (v, k), q in self.ex.items():
+                d[f"exp:{v}^{k}"] = q
+            return d
+        if self.kind == "trig":
+            d = {f"{self.fn}:{self.var}": self.w}
             for (v, k), q in self.ex.items():
                 d[f"exp:{v}^{k}"] = q
             return d
@@ -282,17 +300,29 @@ class Feature:
                         arg = arg + q * (cols[v] if k == 1 else np.power(cols[v], k))
                     out = out * np.exp(np.clip(arg, -700, 700))
                 return out
+            if self.kind == "trig":
+                arg = self.w * cols[self.var]
+                out = np.sin(arg) if self.fn == "sin" else np.cos(arg)
+                for (v, k), q in self.ex.items():
+                    out = out * np.exp(np.clip(q * (cols[v] if k == 1 else np.power(cols[v], k)), -700, 700))
+                return out
             return np.log(cols[self.var])
 
     def complexity(self):
         if self.kind == "log":
             return 3.0
+        if self.kind == "trig":
+            return 4.0 + 2.0 * len(self.ex)
         base = 1.0 + sum(exp_complexity(e) for e in self.exps.values())
         return base + 2.0 * len(self.ex)
 
     def text(self):
         if self.kind == "log":
             return f"log({self.var})"
+        if self.kind == "trig":
+            core = f"{self.fn}({fmt(self.w)}*{self.var})"
+            env = "".join(f"exp({fmt(q)}*{v})*" for (v, k), q in sorted(self.ex.items()))
+            return env + core
         base = mono_text(self.exps) if self.exps else ""
         if self.kind == "m":
             return base or "1"
@@ -855,9 +885,11 @@ def boot_lstsq(A, t, idx, B, rng):
 
 
 class ImplicitFinder:
-    def __init__(self, bundle, cfg, basis, err_cap=None, extra_exps=()):
+    def __init__(self, bundle, cfg, basis, err_cap=None, extra_exps=(), trig=()):
         self.b, self.cfg, self.basis = bundle, cfg, basis
         self.extra_exps = tuple(extra_exps)
+        self.trig = [(v, w, k) for v, w, k in trig if v in basis]
+        self.kmax = cfg.max_terms + (1 if self.trig else 0)
         self.err_cap = err_cap or cfg.accept_err
         self.rng = np.random.default_rng(cfg.seed + 2)
         tr = bundle.train
@@ -900,6 +932,8 @@ class ImplicitFinder:
             fs = build(P, tri)
             if len(fs) <= cfg.max_library:
                 break
+        for v, w, k in self.trig:
+            fs += [Feature.trig("sin", v, w, k), Feature.trig("cos", v, w, k)]
         return fs
 
     def fit_lhs(self, lhs, allow_self=True):
@@ -927,7 +961,7 @@ class ImplicitFinder:
             n[n < 1e-12] = 1e12
             return A / n
 
-        K = cfg.max_terms
+        K = self.kmax
         m1 = beam_search(Phi / nrm, t, K, cfg.beam)
         S = list(m1[max(m1)][1])
         c = np.linalg.lstsq((Phi / nrm)[:, S], t, rcond=None)[0]
@@ -984,6 +1018,15 @@ class ImplicitFinder:
         rel = Relation(lhs, list(zip(coefs, fs)), infos)
         committee = [Relation(lhs, list(zip(row, fs))) for row in C[: cfg.committee]]
         params = [f"coef of {f.text()}: {i.describe()}" for f, i in zip(fs, infos)]
+        for (v, w, kd) in {(f.var, f.w, -sum(f.ex.values())) for f in fs if f.kind == "trig"}:
+            same = lambda f: f.kind == "trig" and f.var == v and f.w == w and abs(-sum(f.ex.values()) - kd) < 1e-12
+            a = sum(c for c, f in zip(coefs, fs) if same(f) and f.fn == "sin")
+            b_ = sum(c for c, f in zip(coefs, fs) if same(f) and f.fn == "cos")
+            env = f"exp({fmt(-kd)}*{v})*" if kd else ""
+            params.append(f"{'damped ' if kd else ''}periodic in {v}: amplitude {math.hypot(a, b_):.4g}, "
+                          f"angular frequency {fmt(w)} (period {2 * math.pi / w:.4g}), "
+                          + (f"decay rate {fmt(kd)}, " if kd else "")
+                          + f"phase {math.atan2(b_, a):.4g} rad  [= amplitude*{env}sin({fmt(w)}*{v} + phase)]")
         return rel, float(np.max(se / np.abs(c))), params, committee
 
     def run(self, lhs_vars=None):
@@ -1008,7 +1051,9 @@ class ImplicitFinder:
                 continue
             best = options[0]
             for o in options[1:]:
-                if o[0]["train"] < 0.6 * best[0]["train"]:
+                # noise in the predicted quantity appears on both sides of a self-referential fit,
+                # which alone makes it look ~2x better; demand a much larger margin
+                if o[0]["train"] < 0.3 * best[0]["train"]:
                     best = o
             st, rel, spread, params, committee = best
             if accept(st, capped):
@@ -1178,6 +1223,168 @@ class SemiLogFinder:
 
 
 # =============================================================================
+# 9c. PERIODIC SCAN: find frequencies w such that a reading contains sin(w v)/cos(w v)
+#     Slow trends are projected out first; every frequency on a log grid is tested in
+#     closed form (vectorised); peaks are refined, their uncertainty estimated from
+#     the RSS curve, and snapped like any constant. Found frequencies become features
+#     of the sparse search, so  P = 5 + 3*sin(2.1*x) + 2*z  can be assembled.
+# =============================================================================
+class PeriodicScan:
+    """Finds (variable, w, decay) such that a reading contains exp(-decay*v)*sin/cos(w*v)."""
+
+    K_GRID = (0.3, 0.6, 1.0, 1.6, 2.5, 4.0, 6.0, 10.0, 16.0, 25.0)   # decay, in e-folds across the core range
+
+    def __init__(self, bundle, cfg, targets, varying, max_peaks=2):
+        self.b, self.cfg, self.max_peaks = bundle, cfg, max_peaks
+        self.targets = [t for t in targets if t in varying]
+        self.varying = list(varying)
+        outs = set(bundle.outputs)
+        self.sources = [v for v in varying if v not in outs] or list(varying)
+
+    @staticmethod
+    def _rss_grid(ws, ks, x, yr, Q, wgt):
+        """RSS of  y ~ baseline + a*e^(-k x) sin(w x) + b*e^(-k x) cos(w x)  for paired (w, k)."""
+        env = np.exp(-np.outer(ks, x - x.min())) if np.any(ks) else 1.0
+        arg = np.outer(ws, x)
+        S = np.sin(arg) * env * wgt
+        C = np.cos(arg) * env * wgt
+        S -= (S @ Q) @ Q.T
+        C -= (C @ Q) @ Q.T
+        ss, cc, sc = (S * S).sum(1), (C * C).sum(1), (S * C).sum(1)
+        sy, cy = S @ yr, C @ yr
+        det = np.maximum(ss * cc - sc * sc, 1e-18)
+        a = (sy * cc - cy * sc) / det
+        b = (cy * ss - sy * sc) / det
+        return (yr @ yr) - a * sy - b * cy
+
+    @staticmethod
+    def _interval(grid, rss, n):
+        rmin = rss.min()
+        inside = grid[rss <= rmin * (1 + 1.0 / max(n - 7, 1))]
+        return max((inside.max() - inside.min()) / 2, 1e-12)
+
+    def _peaks(self, x, y, max_peaks, extra):
+        wgt = 1.0 / np.abs(y)
+        R = x.max() - x.min()
+        Rc = max(np.percentile(x, 95) - np.percentile(x, 5), 1e-12)   # core range (robust to far outliers)
+        n = len(y)
+        xs = (x - x.mean()) / (x.std() + 1e-300)
+        base = [np.ones_like(xs), xs, xs ** 2] + list(extra)
+        peaks = []
+        for _ in range(max_peaks):
+            Q, _ = np.linalg.qr(np.column_stack(base) * wgt[:, None])
+            yw = y * wgt
+            yr = yw - Q @ (Q.T @ yw)
+            rss0 = float(yr @ yr)
+            lo, hi = math.pi / R, min(40 * math.pi / R, 0.4 * n / R)
+            if hi <= lo * 1.5:
+                break
+            ws = np.exp(np.linspace(math.log(lo), math.log(hi), 320))
+            zero = np.zeros_like(ws)
+            rss = self._rss_grid(ws, zero, x, yr, Q, wgt)
+            k0 = int(np.argmin(rss))
+            if rss[k0] > 0.9 * rss0:                         # nothing periodic here: stop early
+                break
+            best = (float(rss[k0]), ws[k0], 0.0)
+            # damped candidates (need >= 1.5 periods so decay and frequency are separable)
+            wmin_d = 2 * math.pi * 1.5 / Rc
+            sel = ws >= wmin_d
+            if sel.any():
+                for c in self.K_GRID:
+                    kk = c / Rc
+                    r = self._rss_grid(ws[sel], np.full(sel.sum(), kk), x, yr, Q, wgt)
+                    j = int(np.argmin(r))
+                    if r[j] < best[0] * 0.5:                  # damping must clearly help
+                        best = (float(r[j]), ws[sel][j], kk)
+            rmin, w0, k = best
+            if k == 0.0 and k0 in (0, len(ws) - 1):
+                break
+            for it in range(3):                               # alternate zooms on w and k
+                half = (0.02, 0.003, 0.0006)[it]
+                fine = np.linspace(w0 * (1 - half), w0 * (1 + half), 201)
+                r2 = self._rss_grid(fine, np.full(201, k), x, yr, Q, wgt)
+                w0 = fine[int(np.argmin(r2))]
+                if k > 0:
+                    kf = np.linspace(k * 0.5, k * 1.6, 201)
+                    r4 = self._rss_grid(np.full(201, w0), kf, x, yr, Q, wgt)
+                    k = kf[int(np.argmin(r4))]
+            fine = np.linspace(w0 * 0.995, w0 * 1.005, 801)
+            r3 = self._rss_grid(fine, np.full(801, k), x, yr, Q, wgt)
+            rmin = float(r3.min())
+            w0 = fine[int(np.argmin(r3))]
+            se_w = self._interval(fine, r3, n)
+            se_k = 0.0
+            if k > 0:
+                kf = np.linspace(k * 0.7, k * 1.3, 601)
+                r5 = self._rss_grid(np.full(601, w0), kf, x, yr, Q, wgt)
+                se_k = self._interval(kf, r5, n)
+            if not (rmin < 0.5 * rss0 and n * math.log(rss0 / max(rmin, 1e-300)) > 80):
+                break
+            peaks.append((w0, se_w, k, se_k))
+            env = np.exp(-k * (x - x.min()))
+            base += [np.sin(w0 * x) * env, np.cos(w0 * x) * env]
+        return peaks
+
+    def _scan_pair(self, t, v):
+        tr = self.b.train
+        y, x = tr.cols[t], tr.cols[v]
+        ok = np.isfinite(y) & np.isfinite(x) & (np.abs(y) > 1e-12)
+        if ok.sum() < 80 or np.ptp(x[ok]) <= 0:
+            return []
+        extra = []
+        for u in self.varying:
+            if u in (t, v):
+                continue
+            a = tr.cols[u][ok]
+            if np.std(a) <= 0:
+                continue
+            z = (a - a.mean()) / a.std()
+            extra += [z, z ** 2]
+            if np.all(a > 0):
+                lg = np.log(a)
+                extra.append((lg - lg.mean()) / (lg.std() + 1e-300))
+        y, x = y[ok], x[ok]
+        peaks = self._peaks(x, y, self.max_peaks, extra)
+        if not peaks:
+            return []
+        xs = (x - x.mean()) / x.std()
+        cols = [np.ones_like(x), xs, xs ** 2] + list(extra)
+        for w, _, k, _ in peaks:
+            env = np.exp(-k * (x - x.min()))
+            cols += [np.sin(w * x) * env, np.cos(w * x) * env]
+        A = np.column_stack(cols) / np.abs(y)[:, None]
+        coef = np.linalg.lstsq(A, np.sign(y), rcond=None)[0]
+        keep = trim_mask(np.sign(y) - A @ coef, self.cfg.trim_k)      # drop outliers, rescan
+        if keep.sum() >= 80:
+            x, y = x[keep], y[keep]
+            extra = [e[keep] for e in extra]
+            peaks = self._peaks(x, y, self.max_peaks, extra) or peaks
+        out = []
+        for w0, se_w, k, se_k in peaks:
+            ci = snap_const(w0, se_w / w0)
+            w = ci.value if ci.origin != "fitted" else float(f"{w0:.6g}")
+            kk = 0.0
+            if k > 0:
+                ck = snap_const(k, se_k / k)
+                kk = ck.value if ck.origin != "fitted" else float(f"{k:.6g}")
+            out.append((w, kk))
+        return out
+
+    def run(self):
+        found = {}
+        for t in self.targets:
+            for v in self.sources:
+                if v == t:
+                    continue
+                for w, k in self._scan_pair(t, v):
+                    lst = found.setdefault(v, [])
+                    if not any(abs(w - w2) / w2 < 2e-3 and abs(k - k2) <= 0.05 * max(k, k2, 1e-9)
+                               for w2, k2 in lst):
+                        lst.append((w, k))
+        return [(v, w, k) for v, lst in found.items() for w, k in lst]
+
+
+# =============================================================================
 # 10. ARCHIVE: KNOWN / DERIVED / REDUNDANT / NOVEL
 # =============================================================================
 class Archive:
@@ -1242,6 +1449,16 @@ class Archive:
         self.all.append(entry)
         if mv is not None and cls in ("NOVEL", "KNOWN"):
             self.mono.append(mv)
+
+    def remove(self, entry):
+        """Withdraw an entry (a superseded approximation) and rebuild the law lattice."""
+        self.entries = [e for e in self.entries if e is not entry]
+        self.all = [e for e in self.all if e is not entry]
+        self.mono = []
+        for e in self.entries:
+            mv = self._mono_vec(e.rel)
+            if mv and e.cls in ("NOVEL", "KNOWN", "DEFINITION"):
+                self.mono.append(mv)
 
     def add_recalled(self, entry):
         entry.cls, entry.recalled = "KNOWN", True
@@ -1308,7 +1525,7 @@ def _plain(x):
 
 
 def feature_to_dict(f):
-    return {"k": f.kind, "e": dict(f.exps), "v": f.var,
+    return {"k": f.kind, "e": dict(f.exps), "v": f.var, "w": f.w, "fn": f.fn,
             "x": [[v, k, q] for (v, k), q in f.ex.items()]}
 
 
@@ -1317,6 +1534,8 @@ def feature_from_dict(d):
         return Feature.mono(d["e"])
     if d["k"] == "log":
         return Feature.log(d["v"])
+    if d["k"] == "trig":
+        return Feature.trig(d["fn"], d["v"], d["w"], decay=-sum(q for _, _, q in d["x"]))
     return Feature.em(d["e"], {(v, int(k)): q for v, k, q in d["x"]})
 
 
@@ -1601,9 +1820,12 @@ class Memory:
         s["seconds"] += float(seconds)
 
     def should_skip(self, name):
-        """A stage that has produced nothing in 8+ runs is only sampled every 5th run."""
+        """Only a stage that is EXPENSIVE (>= 1 s per run) and has produced nothing in 8+ runs is
+        sampled every 5th run. Cheap stages are never skipped: a stage that only fires on certain
+        kinds of data (periodic, exponential) looks useless until the data that needs it arrives."""
         s = self.data["stages"].get(name)
-        if s and s["runs"] >= 8 and s["accepted"] == 0 and (self.data["runs"] % 5) != 0:
+        if (s and s["runs"] >= 8 and s["accepted"] == 0 and s["seconds"] / s["runs"] >= 1.0
+                and (self.data["runs"] % 5) != 0):
             return True
         return False
 
@@ -1772,7 +1994,19 @@ class Discoverer:
         # relation that is far worse than that is an approximation, not a law.
         floor = min([e.stats["train"] for e in self.archive.entries], default=None)
         cap = min(cfg.accept_err, max(3 * floor, 0.004)) if floor is not None else None
-        imp = ImplicitFinder(b, cfg, basis, cap, self.extra_exps)
+        trig = []
+        if mem and mem.should_skip("periodic"):
+            say(cfg, "\n[PERIODIC SCAN] skipped: never paid off in memory (sampled every 5th run)")
+        else:
+            t_ = time.time()
+            trig = PeriodicScan(b, cfg, [o for o in (b.outputs or varying) if o not in recalled_lhs],
+                                varying).run()
+            self._stage("periodic", t_, len(trig))
+            if trig:
+                say(cfg, "\n[PERIODIC SCAN] oscillation found: "
+                         + ", ".join(f"{v}: w={fmt(w)} (period {2 * math.pi / w:.4g})"
+                                     + (f", damping {fmt(k)}" if k else "") for v, w, k in trig))
+        imp = ImplicitFinder(b, cfg, basis, cap, self.extra_exps, trig=trig)
         say(cfg, f"\n[IMPLICIT SEARCH] transform library: {len(imp.feats)} features "
                  f"(powers, ratios, products, logs) over {basis}; beam search, "
                  f"<= {cfg.max_terms} terms")
@@ -1782,7 +2016,35 @@ class Discoverer:
         pool2.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
         say(cfg, f"  {len(pool2)} accepted candidates")
         for e in pool2:
+            if not e.rel.lhs.exps:      # "1 = f(...)" over exactly the variables of an accepted law
+                vs = e.rel.variables()  # is a noise-exploiting restatement, not a new law
+                if any(a.cls in ("NOVEL", "KNOWN") and a.rel.variables() == vs
+                       for a in self.archive.entries):
+                    continue
             self.archive.classify(e)
+
+        # refinement: an explicit law that is far worse than the noise level may only be an
+        # approximation (e.g. a power law fitted to a log curve). Its variable was removed from the
+        # search, so look for a better relation for it and keep that only if >= 2x more accurate.
+        for e in list(self.archive.entries):
+            if (e.cls not in ("NOVEL", "KNOWN") or e.recalled or e.source not in ("power-law", "semilog")
+                    or not e.rel.is_explicit() or e.stats["train"] <= 0.005):
+                continue
+            v = e.rel.lhs_var()
+            t_ = time.time()
+            better = [r for r in ImplicitFinder(b, cfg, list(varying), None, self.extra_exps,
+                                                trig=trig).run(lhs_vars=[v])
+                      if r.stats["train"] < 0.5 * e.stats["train"] and v in r.rel.variables()]
+            self._stage("refine", t_, len(better))
+            if better:
+                r = min(better, key=lambda x: (x.rel.complexity(), x.stats["train"]))
+                say(cfg, f"[REFINE] {e.rel.text()} (error {e.stats['train']:.2%}) was only an approximation; "
+                         f"replaced by {r.rel.text()} (error {r.stats['train']:.2%})")
+                if mem:
+                    mem.note("lesson", f"approximation {e.rel.text()} at {e.stats['train']:.2%} error was "
+                                       f"superseded by {r.rel.text()} at {r.stats['train']:.2%}")
+                self.archive.remove(e)
+                self.archive.classify(r)
 
         # chained search: a reading may be built from OTHER readings (heat from rate and
         # a knob). Basis reduction hid those, so retry unexplained readings with
@@ -1795,7 +2057,7 @@ class Discoverer:
         if missing and eliminated:
             say(cfg, f"\n[CHAINED SEARCH] still unexplained: {missing}; retrying with all "
                      f"variables (including already-explained readings) as building blocks")
-            imp2 = ImplicitFinder(b, cfg, list(varying), cap, self.extra_exps)
+            imp2 = ImplicitFinder(b, cfg, list(varying), cap, self.extra_exps, trig=trig)
             t_ = time.time()
             pool3 = imp2.run(lhs_vars=missing)
             self._stage("chained", t_, len(pool3))
@@ -1891,8 +2153,9 @@ class Discoverer:
 # 13. ACTIVE EXPERIMENT DESIGN
 # =============================================================================
 class ActiveDesigner:
-    def __init__(self, bundle, cfg, controllable, augment=None, extra=()):
+    def __init__(self, bundle, cfg, controllable, augment=None, extra=(), bounds=None):
         self.b, self.cfg, self.ctrl = bundle, cfg, list(controllable)
+        self.bounds = bounds or {}
         self.augment, self.extra = augment, set(extra)
         self.rng = np.random.default_rng(cfg.seed + 7)
 
@@ -1948,6 +2211,8 @@ class ActiveDesigner:
         pts = {}
         for v in self.ctrl:
             lo, hi = full.cols[v].min() / 3, full.cols[v].max() * 3
+            if v in self.bounds:              # never design beyond 3x the instrument's real range
+                lo, hi = max(lo, self.bounds[v][0] / 3), min(hi, self.bounds[v][1] * 3)
             pts[v] = np.exp(self.rng.uniform(math.log(lo), math.log(hi), N))
         if self.augment:
             pts = self.augment(pts)
@@ -2401,7 +2666,7 @@ class Agent:
 
     def design(self, eng, tag):
         d = ActiveDesigner(self.bundle, self.qcfg, list(self.lab.knobs), self.augment,
-                           [x.name for x in self.derived])
+                           [x.name for x in self.derived], bounds=self.lab.knobs)
         prop = d.propose(eng.archive, k=6, replicates=10)
         if prop:
             sel, _ = prop
@@ -2536,6 +2801,24 @@ def make_lab(name, rng):
                 [("R = 30000*c^2*exp(-2500/T)",
                   [(1, Feature.mono({"R": 1})),
                    (-3.0e4, Feature.em({"c": 2}, {"T": (-1, -2500.0)}))])])
+    if name == "wave":
+        return (Lab({"x": (0.2, 8), "z": (0.5, 10)},
+                    wrap({"P": lambda p: 5 + 3 * np.sin(2.1 * p["x"])})),
+                [("P = 5 + 3*sin(2.1*x)",
+                  [M(1, P=1), M(-5), (-3, Feature.trig("sin", "x", 2.1))])])
+    if name == "damped":
+        return (Lab({"x": (0.2, 8), "z": (0.5, 10)},
+                    wrap({"S": lambda p: 4 + 3 * np.exp(-0.35 * (p["x"] - 0.2)) * np.sin(2.5 * p["x"] + 0.4)})),
+                [("S = 4 + 3*exp(-0.35*(x-0.2))*sin(2.5*x + 0.4)",
+                  [M(1, S=1), M(-4 - 0.0), (-3 * math.exp(0.07) * math.cos(0.4), Feature.trig("sin", "x", 2.5, 0.35)),
+                   (-3 * math.exp(0.07) * math.sin(0.4), Feature.trig("cos", "x", 2.5, 0.35))])])
+    if name == "wave2":
+        ph = 0.7
+        return (Lab({"x": (0.2, 8), "z": (0.5, 10)},
+                    wrap({"Q": lambda p: 10 + 4 * np.sin(1.3 * p["x"] + ph) + 2 * p["z"]})),
+                [("Q = 10 + 4*sin(1.3*x + 0.7) + 2*z",
+                  [M(1, Q=1), M(-10), (-4 * math.cos(ph), Feature.trig("sin", "x", 1.3)),
+                   (-4 * math.sin(ph), Feature.trig("cos", "x", 1.3)), M(-2, z=1)])])
     if name == "peak":
         return (Lab({"x": (0.2, 8), "z": (0.5, 10)},
                     wrap({"G": lambda p: 2.0 * np.exp(-(p["x"] - 3) ** 2 / 4)})),
@@ -2567,7 +2850,7 @@ def make_lab(name, rng):
     raise KeyError(name)
 
 
-CHALLENGES = ["law1", "law3", "suite", "pendulum", "composite", "logindex", "decay", "arrhenius", "peak"]
+CHALLENGES = ["law1", "law3", "suite", "pendulum", "composite", "logindex", "decay", "arrhenius", "peak", "wave", "wave2", "damped"]
 
 
 def run_challenge(name, cfg, seed, memory=None):
