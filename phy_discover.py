@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 PHY_DISCOVER - single-file hypothesis-discovery engine + autonomous agent
 =========================================================================
