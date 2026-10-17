@@ -9,6 +9,10 @@ invariants, sparse implicit laws, snapped constants, dimensionless groups,
 equivalence detection (KNOWN/DERIVED/REDUNDANT/NOVEL), interestingness scores,
 and active experiment design.
 
+Memory: pass a JSON file (`memory="phy_memory.json"` / `--memory`) and the engine
+re-validates remembered laws instead of rediscovering them, reuses learned constants,
+exponents and invented variables, remembers falsified hypotheses, and keeps notes.
+
 Part 2 (agent): a lab-driven agent that designs its own experiments, INVENTS new
 variables (single-index search), learns exponents back into its vocabulary,
 falsifies its own hypotheses on fresh far-range measurements, and invents latent
@@ -106,6 +110,7 @@ GRAMMAR = [0.1, 0.2, 0.25, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 9.8, 9.81,
 # Built-in constant priors. V4 default: on. V5 turns them OFF so every constant
 # is learned from data alone (e.g. 2*pi is reported as 6.2832, not recognised).
 PRIORS = {"named": True, "grammar": True}
+MEM_CONSTS = []      # constants confirmed in >=2 earlier runs (filled by Memory)
 
 
 @dataclass
@@ -159,6 +164,9 @@ def snap_const(value, se_rel):
             if PRIORS["named"]:
                 for name, val in NAMED:
                     consider(2.0, val, False, name)
+            if tol <= 0.01:                    # remembered constants: reuse across datasets
+                for val in MEM_CONSTS:
+                    consider(1.6, val, False, fmt(val))
     if best[0] is None:
         return ConstInfo(sign * float(f"{v:.6g}"), value, se_abs, "fitted")
     _, _, shown, inv, label = best[0]
@@ -567,6 +575,7 @@ class Entry:
         self.rel, self.source, self.stats = rel, source, stats
         self.spread, self.params, self.committee = spread, params, committee
         self.cls, self.aliases, self.scores, self.dim = None, [], {}, "n/a"
+        self.recalled, self.memory_id, self.warn = False, None, []
 
 
 def accept(stats, cfg):
@@ -1234,6 +1243,14 @@ class Archive:
         if mv is not None and cls in ("NOVEL", "KNOWN"):
             self.mono.append(mv)
 
+    def add_recalled(self, entry):
+        entry.cls, entry.recalled = "KNOWN", True
+        self.entries.append(entry)
+        self.all.append(entry)
+        mv = self._mono_vec(entry.rel)
+        if mv:
+            self.mono.append(mv)
+
     def ranked(self):
         return sorted((e for e in self.entries if e.cls != "DEFINITION"),
                       key=lambda e: -e.scores.get("interestingness", 0))
@@ -1257,13 +1274,392 @@ def score_entry(e, bundle):
                     novelty=nov, interestingness=inter)
 
 
+import time as _time
+# =============================================================================
+# 11b. PERSISTENT MEMORY  (a JSON file the engine reads at start and writes at end)
+#
+#   laws        validated relations (confirmed / failed counts) -> recalled and
+#               re-validated in milliseconds instead of rediscovered
+#   falsified   hypotheses that died on out-of-range data -> never trusted blindly again
+#   constants   learned constants seen in >= 2 runs -> reused when snapping
+#   exponents   exponents seen in >= 2 runs -> added to the search vocabulary
+#   inventions  invented variables (index vectors) -> re-adopted after a 1-line check
+#   stages      cost/yield per search stage -> unproductive stages are sampled less
+#   notes       the engine's own log: what it found, what failed, lessons, hints
+#   history     one line per run
+# =============================================================================
+import datetime as _dt
+import json as _json
+import os as _os
+
+
+def _plain(x):
+    if isinstance(x, dict):
+        return {str(k): _plain(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_plain(v) for v in x]
+    if isinstance(x, (np.floating,)):
+        return float(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, np.bool_):
+        return bool(x)
+    return x
+
+
+def feature_to_dict(f):
+    return {"k": f.kind, "e": dict(f.exps), "v": f.var,
+            "x": [[v, k, q] for (v, k), q in f.ex.items()]}
+
+
+def feature_from_dict(d):
+    if d["k"] == "m":
+        return Feature.mono(d["e"])
+    if d["k"] == "log":
+        return Feature.log(d["v"])
+    return Feature.em(d["e"], {(v, int(k)): q for v, k, q in d["x"]})
+
+
+def relation_to_dict(rel):
+    def ci(c):
+        return None if c is None else dict(value=c.value, raw=c.raw, se=c.se, origin=c.origin,
+                                           label=c.label, inv=c.inv)
+    return {"lhs": feature_to_dict(rel.lhs),
+            "rhs": [{"c": float(c), "f": feature_to_dict(f), "ci": ci(i)}
+                    for (c, f), i in zip(rel.rhs, rel.cinfo)]}
+
+
+def relation_from_dict(d):
+    rhs, infos = [], []
+    for t in d["rhs"]:
+        rhs.append((t["c"], feature_from_dict(t["f"])))
+        infos.append(None if t["ci"] is None else ConstInfo(**t["ci"]))
+    return Relation(feature_from_dict(d["lhs"]), rhs, infos)
+
+
+class Memory:
+    VERSION = 1
+    MAX_NOTES, MAX_HISTORY = 400, 200
+    BASE_EXPS = {-2.0, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 3.0}
+
+    def __init__(self, path="phy_memory.json", domain="", autosave=True):
+        self.path, self.domain, self.autosave = path, domain, autosave
+        self.data = self._fresh()
+        self.session = dict(recalled=0, new=0, failed=0, notes=0, falsified=0)
+        if path and _os.path.exists(path):
+            self._load()
+        self._next = 1 + max([r["id"] for r in self.data["laws"] + self.data["retired"]], default=0)
+        self._refresh_constants()
+
+    # ---- persistence ------------------------------------------------------
+    @staticmethod
+    def _now():
+        return _dt.datetime.now().isoformat(timespec="seconds")
+
+    def _fresh(self):
+        t = self._now()
+        return {"version": self.VERSION, "created": t, "updated": t, "runs": 0,
+                "laws": [], "retired": [], "falsified": [], "constants": [],
+                "constant_relations": [], "exponents": {}, "inventions": [],
+                "stages": {}, "notes": [], "history": []}
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                d = _json.load(f)
+            base = self._fresh()
+            base.update({k: v for k, v in d.items() if k in base})
+            self.data = base
+        except Exception as ex:           # corrupt file: keep it, start clean, say so
+            bad = f"{self.path}.corrupt-{int(_time.time())}"
+            try:
+                _os.replace(self.path, bad)
+            except OSError:
+                pass
+            self.data = self._fresh()
+            self.note("warning", f"memory file was unreadable ({type(ex).__name__}); "
+                                 f"moved to {_os.path.basename(bad)} and started fresh")
+
+    def save(self):
+        if not self.path:
+            return
+        self.data["updated"] = self._now()
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(_plain(self.data), f, indent=1)
+        _os.replace(tmp, self.path)       # atomic: a crash never leaves a half-written file
+
+    # ---- notes -------------------------------------------------------------
+    def note(self, kind, text, **data):
+        for n in self.data["notes"]:
+            if n["kind"] == kind and n["text"] == text:
+                n["count"] += 1
+                n["t"] = self._now()
+                return
+        self.data["notes"].append(dict(t=self._now(), kind=kind, text=text, count=1, **_plain(data)))
+        self.session["notes"] += 1
+        if len(self.data["notes"]) > self.MAX_NOTES:
+            drop = next((i for i, n in enumerate(self.data["notes"]) if n["count"] == 1), 0)
+            self.data["notes"].pop(drop)
+
+    # ---- laws ---------------------------------------------------------------
+    def recall(self, variables):
+        vs = set(variables)
+        out = []
+        for rec in self.data["laws"]:
+            if self.domain and rec.get("domain", "") != self.domain:
+                continue
+            if set(rec["vars"]) <= vs:
+                try:
+                    out.append((rec, relation_from_dict(rec["rel"])))
+                except Exception:
+                    continue
+        return out
+
+    def _find_law(self, rel):
+        vs = set(rel.variables())
+        for rec in self.data["laws"]:
+            if set(rec["vars"]) == vs:
+                try:
+                    if terms_match(relation_from_dict(rec["rel"]).terms(), rel.terms()):
+                        return rec
+                except Exception:
+                    pass
+        return None
+
+    def remember_law(self, entry, variables, ranges, dataset):
+        rel, t = entry.rel, self._now()
+        rec = self._find_law(rel)
+        if rec:
+            rec["seen"] += 1
+            rec["confirmed"] += 1
+            rec["last_seen"] = t
+            for v, (lo, hi) in ranges.items():
+                if v in rec["ranges"]:
+                    rec["ranges"][v] = [min(lo, rec["ranges"][v][0]), max(hi, rec["ranges"][v][1])]
+            if entry.spread < rec.get("spread", 1e9):      # keep the better-determined constants
+                rec.update(rel=relation_to_dict(rel), text=rel.text(), spread=float(entry.spread),
+                           err=float(entry.stats["test"]))
+            return False
+        self.data["laws"].append(dict(
+            id=self._next, text=rel.text(), rel=relation_to_dict(rel),
+            vars=sorted(rel.variables()), context=sorted(variables), domain=self.domain,
+            source=entry.source, seen=1, confirmed=1, failed=0, first_seen=t, last_seen=t,
+            spread=float(entry.spread), err=float(entry.stats["test"]),
+            ranges={v: ranges[v] for v in rel.variables() if v in ranges}, dataset=dataset))
+        self._next += 1
+        self.session["new"] += 1
+        self._unfalsify(rel)
+        self.note("discovery", f"learned: {rel.text()}  (test error {entry.stats['test']:.2%}, "
+                               f"dataset '{dataset}')")
+        return True
+
+    def apply_validation(self, rid, ok, jaccard, dataset):
+        rec = next((r for r in self.data["laws"] if r["id"] == rid), None)
+        if rec is None:
+            return
+        if ok:
+            rec["confirmed"] += 1
+            rec["seen"] += 1
+            rec["last_seen"] = self._now()
+            self.session["recalled"] += 1
+        elif jaccard >= 0.5:          # only blame the law if the dataset really is its context
+            rec["failed"] += 1
+            self.session["failed"] += 1
+            self.note("lesson", f"remembered law failed on '{dataset}': {rec['text']}")
+            if rec["failed"] >= 3 and rec["failed"] > rec["confirmed"]:
+                self.data["laws"].remove(rec)
+                self.data["retired"].append(rec)
+                self.note("lesson", f"retired law (failed {rec['failed']}x, confirmed "
+                                    f"{rec['confirmed']}x): {rec['text']}")
+
+    def falsify(self, rel, reason, variables):
+        for f in self.data["falsified"]:
+            try:
+                if set(f["vars"]) == set(rel.variables()) and \
+                   terms_match(relation_from_dict(f["rel"]).terms(), rel.terms()):
+                    f["count"] += 1
+                    f["t"] = self._now()
+                    return
+            except Exception:
+                pass
+        self.data["falsified"].append(dict(text=rel.text(), rel=relation_to_dict(rel),
+                                           vars=sorted(rel.variables()), reason=reason,
+                                           t=self._now(), count=1))
+        self.session["falsified"] += 1
+        self.note("falsified", f"{rel.text()}  - {reason}")
+
+    def is_falsified(self, rel, variables):
+        vs = set(variables)
+        for f in self.data["falsified"]:
+            if set(f["vars"]) <= vs and set(f["vars"]) == set(rel.variables()):
+                try:
+                    if terms_match(relation_from_dict(f["rel"]).terms(), rel.terms()):
+                        return f
+                except Exception:
+                    pass
+        return None
+
+    def _unfalsify(self, rel):
+        keep = []
+        for f in self.data["falsified"]:
+            try:
+                same = set(f["vars"]) == set(rel.variables()) and \
+                    terms_match(relation_from_dict(f["rel"]).terms(), rel.terms())
+            except Exception:
+                same = False
+            if same:
+                self.note("lesson", f"previously falsified law now holds on new data: {f['text']}")
+            else:
+                keep.append(f)
+        self.data["falsified"] = keep
+
+    # ---- constants -----------------------------------------------------------
+    @staticmethod
+    def _simple(v):
+        """<= 2 significant digits (2, 0.5, 4.2, 30000 ...): trivial to snap, not worth remembering."""
+        return abs(float(f"{v:.1e}") - v) <= 1e-9 * abs(v)
+
+    def remember_constants(self, items):
+        for value, se_rel, text in items:
+            v = abs(float(value))
+            if not math.isfinite(v) or v <= 0 or self._simple(v):
+                continue
+            se = max(float(se_rel), 1e-7)
+            for c in self.data["constants"]:
+                if abs(c["value"] - v) / v <= min(max(3 * max(se, c["se_rel"]), 1e-6), 0.01):
+                    c["count"] += 1
+                    if se < c["se_rel"]:
+                        c["value"], c["se_rel"] = v, se
+                    if text not in c["where"]:
+                        c["where"] = (c["where"] + [text])[-4:]
+                    break
+            else:
+                self.data["constants"].append(dict(value=v, se_rel=se, count=1, where=[text]))
+        self._refresh_constants()
+        self._mine_constant_relations()
+
+    def confirmed_constants(self):
+        return [c["value"] for c in self.data["constants"]
+                if c["count"] >= 2 and c["se_rel"] <= 0.003]
+
+    def _refresh_constants(self):
+        MEM_CONSTS[:] = self.confirmed_constants()
+
+    def _mine_constant_relations(self):
+        good = [c for c in self.data["constants"] if c["count"] >= 2 and c["se_rel"] <= 5e-4]
+        forms = [("{b} = {a}^2", lambda a: a * a), ("{b} = sqrt({a})", math.sqrt),
+                 ("{b} = 2*{a}", lambda a: 2 * a), ("{b} = {a}/2", lambda a: a / 2),
+                 ("{b} = 1/{a}", lambda a: 1 / a)]
+        have = {r["text"] for r in self.data["constant_relations"]}
+        for ca in good:
+            for cb in good:
+                if ca is cb:
+                    continue
+                for pat, fn in forms:
+                    tol = min(4 * max(ca["se_rel"], cb["se_rel"]) + 1e-6, 1e-3)
+                    if abs(fn(ca["value"]) - cb["value"]) / cb["value"] <= tol:
+                        txt = pat.format(a=fmt(ca["value"]), b=fmt(cb["value"]))
+                        if txt not in have:
+                            have.add(txt)
+                            self.data["constant_relations"].append(dict(text=txt, t=self._now()))
+                            self.note("constant-relation", f"two learned constants are related: {txt}")
+
+    # ---- vocabulary / inventions / stages ---------------------------------------
+    def remember_exponents(self, values):
+        for x in values:
+            if abs(x) > 4 or abs(x) < 1e-9:
+                continue
+            k = f"{x:g}"
+            self.data["exponents"][k] = self.data["exponents"].get(k, 0) + 1
+
+    def top_exponents(self, min_count=2, k=6):
+        items = [(c, float(x)) for x, c in self.data["exponents"].items()
+                 if c >= min_count and float(x) not in self.BASE_EXPS]
+        return [x for _, x in sorted(items, reverse=True)[:k]]
+
+    def remember_invention(self, name, exps, knobs, target, rough):
+        for r in self.data["inventions"]:
+            if r["exps"] == exps and set(r["knobs"]) == set(knobs) and r["target"] == target:
+                r["count"] += 1
+                r["last"] = self._now()
+                return
+        self.data["inventions"].append(dict(name=name, exps=exps, knobs=sorted(knobs),
+                                            target=target, rough=float(rough), count=1,
+                                            last=self._now()))
+        self.note("discovery", f"invented variable {name} := {mono_text(exps)} "
+                               f"(makes '{target}' a 1-D function)")
+
+    def recall_inventions(self, knobs, outputs):
+        return [r for r in self.data["inventions"]
+                if set(r["knobs"]) == set(knobs) and r["target"] in outputs]
+
+    def record_stage(self, name, seconds, accepted):
+        s = self.data["stages"].setdefault(name, dict(runs=0, accepted=0, seconds=0.0))
+        s["runs"] += 1
+        s["accepted"] += int(accepted)
+        s["seconds"] += float(seconds)
+
+    def should_skip(self, name):
+        """A stage that has produced nothing in 8+ runs is only sampled every 5th run."""
+        s = self.data["stages"].get(name)
+        if s and s["runs"] >= 8 and s["accepted"] == 0 and (self.data["runs"] % 5) != 0:
+            return True
+        return False
+
+    def record_run(self, **info):
+        self.data["runs"] += 1
+        self.data["history"].append(dict(t=self._now(), **_plain(info)))
+        self.data["history"] = self.data["history"][-self.MAX_HISTORY:]
+
+    # ---- human-readable --------------------------------------------------------
+    def describe(self, notes=12):
+        d = self.data
+        L = [f"memory file: {self.path}   (runs: {d['runs']}, updated {d['updated']})",
+             f"  laws remembered: {len(d['laws'])}   retired: {len(d['retired'])}   "
+             f"falsified: {len(d['falsified'])}   constants: {len(d['constants'])} "
+             f"({len(self.confirmed_constants())} confirmed)   inventions: {len(d['inventions'])}"]
+        for r in sorted(d["laws"], key=lambda r: -r["confirmed"])[:15]:
+            L.append(f"   [{r['id']}] {r['text']}   (confirmed {r['confirmed']}x, failed {r['failed']}x,"
+                     f" err {r['err']:.2%})")
+        for r in d["inventions"]:
+            L.append(f"   invention {r['name']} := {mono_text(r['exps'])} for '{r['target']}' "
+                     f"(seen {r['count']}x)")
+        for r in d["constant_relations"]:
+            L.append(f"   constant relation: {r['text']}")
+        if d["stages"]:
+            L.append("   stage stats: " + "; ".join(
+                f"{k}: {v['accepted']} accepted / {v['runs']} runs / {v['seconds']:.1f}s"
+                for k, v in d["stages"].items()))
+        L.append("  recent notes:")
+        for n in d["notes"][-notes:]:
+            L.append(f"   - [{n['kind']}] {n['text']}" + (f"  (x{n['count']})" if n["count"] > 1 else ""))
+        return "\n".join(L)
+
+    def forget(self, text):
+        n0 = len(self.data["laws"])
+        self.data["laws"] = [r for r in self.data["laws"] if text not in r["text"]]
+        self.data["falsified"] = [r for r in self.data["falsified"] if text not in r["text"]]
+        self.note("lesson", f"forgot laws matching '{text}' (user request)")
+        return n0 - len(self.data["laws"])
+
+
+def as_memory(m):
+    if m is None or isinstance(m, Memory):
+        return m
+    return Memory(str(m))
+
+
 # =============================================================================
 # 12. DISCOVERER (pipeline)
 # =============================================================================
 class Discoverer:
-    def __init__(self, bundle, cfg, known=(), name="", defs=(), extra_exps=()):
+    def __init__(self, bundle, cfg, known=(), name="", defs=(), extra_exps=(), memory=None):
         self.b, self.cfg, self.known, self.name = bundle, cfg, known, name
-        self.extra_exps = tuple(extra_exps)
+        self.memory = memory
+        self.extra_exps = tuple(sorted(set(extra_exps) | (set(memory.top_exponents()) if memory else set())))
+        self.pending, self.stage_log, self.memory_summary = [], {}, ""
+        self.recalled_n = 0
         self.archive = Archive(known, bundle.variables)
         self.hints = []
         for d in defs:      # definitions of invented variables are bookkeeping, not discoveries
@@ -1282,14 +1678,75 @@ class Discoverer:
         loggable = {v for v, i in info.items() if i["positive"] and i["varying"]}
         varying = [v for v, i in info.items() if i["varying"]]
 
+        mem = self.memory
+        recalled_lhs, fast = set(), False
+        if mem:
+            MEM_CONSTS[:] = mem.confirmed_constants()
+            for rec, rel in mem.recall(b.variables):
+                st = evaluate_relation(rel, b)
+                ok = accept(st, cfg)
+                jac = len(set(rec["context"]) & set(b.variables)) / max(1, len(set(rec["context"]) | set(b.variables)))
+                self.pending.append((rec["id"], ok, jac))
+                if not ok:
+                    continue
+                e = Entry(rel, "memory", st, rec.get("spread", 0.0),
+                          [f"remembered law (confirmed {rec['confirmed']}x, first seen {rec['first_seen'][:10]})"], [])
+                e.memory_id = rec["id"]
+                self.archive.add_recalled(e)
+                self.recalled_n += 1
+                if rel.is_explicit():
+                    recalled_lhs.add(rel.lhs_var())
+            if self.recalled_n:
+                say(cfg, f"\n[MEMORY] re-validated {self.recalled_n} remembered law(s) on this data "
+                         f"in {time.time() - t0:.2f}s; readings already explained: {sorted(recalled_lhs)}")
+            outs = [o for o in b.outputs if o in varying]
+            fast = bool(outs) and all(o in recalled_lhs for o in outs)
+        if fast:
+            say(cfg, "[MEMORY] every reading is explained by a remembered law that still holds -> "
+                     "skipping search")
+        else:
+            self._search(loggable, varying, recalled_lhs)
+
+        for e in self.archive.all:
+            if e.cls == "DEFINITION":
+                continue
+            e.dim = dim_status(e.rel, b)
+            score_entry(e, b)
+            if mem and not e.recalled:
+                f = mem.is_falsified(e.rel, b.variables)
+                if f:
+                    e.warn.append(f"previously FALSIFIED on out-of-range data ({f['reason']}); "
+                                  f"treat with suspicion")
+                    e.scores["interestingness"] *= 0.5
+        say(cfg, f"\n[done in {time.time() - t0:.1f}s]")
+        return self.archive
+
+
+    def _stage(self, name, t0, accepted):
+        self.stage_log[name] = (time.time() - t0, int(accepted))
+
+    def _search(self, loggable, varying, recalled_lhs):
+        b, cfg, mem = self.b, self.cfg, self.memory
         say(cfg, "\n[POWER LAWS / INVARIANTS] log-space null-space search"
                  + (" + dimensionless groups" if b.dims else ""))
+        t_ = time.time()
         pl = PowerLawFinder(b, cfg, loggable)
         pool = pl.run()
         self.hints = pl.hints
+        self._stage("power-law", t_, len(pool))
         targets = [o for o in b.outputs if o in loggable] or sorted(loggable)
-        say(cfg, "\n[SEMI-LOG LAWS] exponential / Arrhenius / Gaussian dependence")
-        pool += SemiLogFinder(b, cfg, targets, loggable, set(varying)).run()
+        targets = [t for t in targets if t not in recalled_lhs]
+        if mem and mem.should_skip("semilog"):
+            say(cfg, "\n[SEMI-LOG LAWS] skipped: this stage has never paid off in memory "
+                     "(sampled every 5th run)")
+            mem.note("lesson", "semilog stage skipped: 0 accepted laws in 8+ earlier runs "
+                               "(re-sampled every 5th run)")
+        else:
+            say(cfg, "\n[SEMI-LOG LAWS] exponential / Arrhenius / Gaussian dependence")
+            t_ = time.time()
+            sl_pool = SemiLogFinder(b, cfg, targets, loggable, set(varying)).run()
+            self._stage("semilog", t_, len(sl_pool))
+            pool += sl_pool
         # Per-variable noise floor: a relation far worse than the best law that
         # involves the same variables is an approximation of a true law, not a law.
         floor = {}
@@ -1319,7 +1776,9 @@ class Discoverer:
         say(cfg, f"\n[IMPLICIT SEARCH] transform library: {len(imp.feats)} features "
                  f"(powers, ratios, products, logs) over {basis}; beam search, "
                  f"<= {cfg.max_terms} terms")
+        t_ = time.time()
         pool2 = imp.run()
+        self._stage("implicit", t_, len(pool2))
         pool2.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
         say(cfg, f"  {len(pool2)} accepted candidates")
         for e in pool2:
@@ -1337,20 +1796,58 @@ class Discoverer:
             say(cfg, f"\n[CHAINED SEARCH] still unexplained: {missing}; retrying with all "
                      f"variables (including already-explained readings) as building blocks")
             imp2 = ImplicitFinder(b, cfg, list(varying), cap, self.extra_exps)
+            t_ = time.time()
             pool3 = imp2.run(lhs_vars=missing)
+            self._stage("chained", t_, len(pool3))
             pool3.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
             say(cfg, f"  {len(pool3)} accepted candidates")
             for e in pool3:
                 e.source = "implicit (chained)"
                 self.archive.classify(e)
 
-        for e in self.archive.all:
+    def commit_memory(self, context=None, notes=()):
+        """Write what this run learned into the memory file. Call once, at the end."""
+        mem, b = self.memory, self.b
+        if mem is None:
+            return ""
+        ctx = dict(context or {})
+        ranges = {v: [float(b.full.cols[v].min()), float(b.full.cols[v].max())] for v in b.variables}
+        mem.session.update(recalled=0, new=0, failed=0)
+        for rid, ok, jac in self.pending:
+            mem.apply_validation(rid, ok, jac, self.name or "data")
+        consts, exps = [], []
+        for e in self.archive.entries:
             if e.cls == "DEFINITION":
                 continue
-            e.dim = dim_status(e.rel, b)
-            score_entry(e, b)
-        say(cfg, f"\n[done in {time.time() - t0:.1f}s]")
-        return self.archive
+            if e.cls in ("NOVEL", "KNOWN") and not e.recalled:
+                mem.remember_law(e, b.variables, ranges, self.name or "data")
+            if e.cls in ("NOVEL", "KNOWN", "DERIVED"):
+                for (c, f), ci in zip(e.rel.rhs, e.rel.cinfo):
+                    if ci is not None and ci.origin in ("learned", "fitted") and ci.value:
+                        consts.append((ci.value, abs(ci.se / ci.value) if ci.value else 1.0, e.rel.text()))
+                    if f.kind in ("m", "em"):
+                        exps += list(f.exps.values())
+        mem.remember_constants(consts)
+        mem.remember_exponents(exps)
+        for st, (sec, acc) in self.stage_log.items():
+            mem.record_stage(st, sec, acc)
+        for h in self.hints[:3]:
+            mem.note("hint", f"{h[0]} ~ C_experiment * {mono_text(h[1])}; constants differ by experiment "
+                             f"{h[2]} (hidden variable?)")
+        for n in notes:
+            mem.note("run", n)
+        novel = sum(1 for e in self.archive.entries if e.cls == "NOVEL" and not e.recalled)
+        total_t = sum(v[0] for v in self.stage_log.values())
+        mem.record_run(dataset=self.name or "data", variables=b.variables, experiments=b.full.n_exp,
+                       rows=b.full.n, recalled=self.recalled_n, new=novel,
+                       search_seconds=round(total_t, 2), **{k: v for k, v in ctx.items()
+                                                            if isinstance(v, (int, float, str, list))})
+        mem.note("run", f"run {mem.data['runs']} on '{self.name or 'data'}': {self.recalled_n} law(s) recalled, "
+                        f"{novel} new, search {total_t:.1f}s")
+        mem.save()
+        self.memory_summary = (f"memory '{mem.path}': {self.recalled_n} recalled, {novel} new law(s) learned; "
+                               f"{len(mem.data['laws'])} laws, {len(mem.data['notes'])} notes stored")
+        return self.memory_summary
 
     def report(self, top=20):
         A = self.archive
@@ -1733,8 +2230,10 @@ def index_search(cols, inputs, target, thr=0.012, ratio=0.35, max_support=3):
 # 3. THE AGENT
 # =============================================================================
 class Agent:
-    def __init__(self, lab, cfg, rng, n0=200, max_rounds=4, quiet_cfg=True):
+    def __init__(self, lab, cfg, rng, n0=200, max_rounds=4, quiet_cfg=True, memory=None, name="agent"):
         self.lab, self.cfg, self.rng = lab, cfg, rng
+        self.memory, self.name = memory, name
+        self.events = []
         self.n0, self.max_rounds = n0, max_rounds
         self.qcfg = Config(**{**cfg.__dict__, "verbose": False})
         self.raw, self.derived, self.outputs = [], [], set()
@@ -1782,9 +2281,9 @@ class Agent:
     # ---- 2. discover -----------------------------------------------------------
     def discover(self):
         self.bundle = DataBundle(self.experiments(), self.qcfg, outputs=sorted(self.outputs))
-        eng = Discoverer(self.bundle, self.qcfg, name="agent",
+        eng = Discoverer(self.bundle, self.qcfg, name=self.name,
                          defs=[d.relation() for d in self.derived],
-                         extra_exps=sorted(self.extra_exps))
+                         extra_exps=sorted(self.extra_exps), memory=self.memory)
         eng.run()
         self.eng = eng
         # grammar growth: exponents seen in accepted laws join the search vocabulary
@@ -1818,6 +2317,38 @@ class Agent:
                     pass
         return grounded
 
+    # ---- memory: re-adopt earlier inventions after a cheap validity check -----------
+    def _free_name(self):
+        used = {d.name for d in self.derived}
+        k = 1
+        while f"u{k}" in used:
+            k += 1
+        return f"u{k}"
+
+    def recall_inventions(self):
+        mem = self.memory
+        if not mem:
+            return
+        cols = {k: np.concatenate([c[k] for _, c in self.raw]) for k in self.raw[0][1]}
+        for rec in mem.recall_inventions(list(self.lab.knobs), self.outputs):
+            if rec["name"] in {d.name for d in self.derived} or \
+               any(d.exps == rec["exps"] for d in self.derived):
+                continue
+            t = rec["target"]
+            if t not in cols or not np.all(cols[t] > 0):
+                continue
+            u = sum(p * np.log(cols[v]) for v, p in rec["exps"].items())
+            r = roughness(u, np.log(cols[t]))
+            if r <= 0.012:
+                d = DerivedVar(rec["name"], rec["exps"])
+                self.derived.append(d)
+                rec["count"] += 1
+                self.say(f"[MEMORY] re-adopted invented variable {d.text()} "
+                         f"(roughness of '{t}' vs {d.name}: {r:.4f}) - no search needed")
+            else:
+                mem.note("lesson", f"remembered invention {rec['name']} := {mono_text(rec['exps'])} "
+                                   f"no longer makes '{t}' a 1-D function (roughness {r:.3f})")
+
     # ---- 3. invent -------------------------------------------------------------
     def invent(self, eng):
         seen = self.explained(eng)
@@ -1836,9 +2367,11 @@ class Agent:
             same = [d for d in self.derived if d.exps == res["exps"]]
             if same:
                 continue
-            name = f"u{len(self.derived) + 1}"
+            name = self._free_name()
             d = DerivedVar(name, res["exps"])
             self.derived.append(d)
+            if self.memory:
+                self.memory.remember_invention(name, res["exps"], knobs, t, res["rough"])
             made = True
             self.say(f"         INVENTED  {d.text()}   (roughness of {t} vs {name}: "
                      f"{res['rough']:.4f}; best single knob: {res['base']:.3f})")
@@ -1859,6 +2392,11 @@ class Agent:
                      f"{e.rel.text()}")
             if not ok:
                 bad.append(e)
+                if self.memory:
+                    self.memory.falsify(e.rel, f"error {err:.3f} on measurements 3x outside the range "
+                                               f"(limit {lim:.3f})", list(st.cols))
+                if e.recalled:
+                    self.events.append(f"remembered law failed extrapolation: {e.rel.text()}")
         return bad
 
     def design(self, eng, tag):
@@ -1874,6 +2412,7 @@ class Agent:
     # ---- main loop -------------------------------------------------------------
     def run(self):
         self.explore()
+        self.recall_inventions()
         prev = None
         for r in range(self.max_rounds):
             self.say(f"\n--- round {r} " + "-" * 60)
@@ -1888,13 +2427,30 @@ class Agent:
                      f"{len(self.derived)} invented variable(s); "
                      f"{self.lab.count} measurements so far")
             bad = self.falsify(eng, r)
+            ents = [e for e in eng.archive.entries if e.cls != "DEFINITION"]
+            if not bad and ents and all(e.recalled for e in ents):
+                self.say("[STOP] every hypothesis was already in memory and survived fresh "
+                         "out-of-range measurements - nothing new to learn")
+                break
             if not bad and sig == prev:
                 self.say("[STOP] hypotheses unchanged and none falsified")
                 break
+            if self.memory:
+                self.memory.save()
             prev = sig
             if not bad:
                 self.design(eng, r)
         self.eng = self.discover()
+        used = set()
+        for e in self.eng.archive.entries:
+            if e.cls != "DEFINITION":
+                used |= e.rel.variables()
+        self.derived = [d for d in self.derived if d.name in used]
+        if self.memory:
+            notes = [f"agent '{self.name}': {self.lab.count} lab measurements, "
+                     f"{len(self.derived)} invented variable(s)"] + self.events
+            self.eng.commit_memory(context=dict(measurements=self.lab.count,
+                                                knobs=list(self.lab.knobs)), notes=notes)
         return self.eng
 
 
@@ -2014,14 +2570,14 @@ def make_lab(name, rng):
 CHALLENGES = ["law1", "law3", "suite", "pendulum", "composite", "logindex", "decay", "arrhenius", "peak"]
 
 
-def run_challenge(name, cfg, seed):
+def run_challenge(name, cfg, seed, memory=None):
     rng = np.random.default_rng(seed)
     lab, truths = make_lab(name, rng)
     print("\n" + "#" * 78)
     print(f"# AUTONOMOUS CHALLENGE: {name}")
     print("# The agent gets knob names + ranges only. No data, no formula, no target.")
     print("#" * 78)
-    agent = Agent(lab, cfg, rng)
+    agent = Agent(lab, cfg, rng, memory=memory, name=name)
     eng = agent.run()
     print("\n[INVENTED VARIABLES]",
           "; ".join(d.text() for d in agent.derived) if agent.derived else "none needed")
@@ -2038,6 +2594,12 @@ def run_challenge(name, cfg, seed):
     ents = [e for e in eng.archive.all if e.cls != "DEFINITION"]
     for label, terms in truths:
         hit = [e for e in ents if terms_match(expand_terms(e.rel, agent.derived), terms)]
+        if not hit and len(terms) == 2 and all(f.kind == "m" for _, f in terms):
+            tm = Archive._mono_vec(Relation(terms[0][1], [(-terms[1][0], terms[1][1])]))
+            if tm is not None and tm[0] and eng.archive.mono:
+                cls, _ = eng.archive._mono_class(*tm)
+                if cls in ("DERIVED", "REDUNDANT"):          # follows from archived laws
+                    hit = [e for e in ents if e.rel.variables() & set(tm[0])][:1]
         if hit:
             m = sorted(hit, key=lambda e: e.cls == "REDUNDANT")[0]
             print(f"  TRUE  {label}\n  FOUND {m.rel.text()}   [{m.cls}]  "
@@ -2156,8 +2718,9 @@ def to_experiments(data, experiment=None):
 class Result:
     """What `discover()` returns."""
 
-    def __init__(self, engine, bundle, derived=(), notes=()):
+    def __init__(self, engine, bundle, derived=(), notes=(), memory=None):
         self.engine, self.bundle, self.derived, self.notes = engine, bundle, list(derived), list(notes)
+        self.memory = memory
 
     @property
     def entries(self):
@@ -2176,11 +2739,17 @@ class Result:
             lines.append(f"invented variable: {d.text()}")
         for i, e in enumerate(self.entries, 1):
             st = e.stats
-            lines.append(f"{i}. {e.rel.text()}    [{e.cls}; median error {st['test']:.2%} on held-out "
+            lines.append(f"{i}. {e.rel.text()}    [{e.cls}{' - remembered' if e.recalled else ''}; "
+                         f"median error {st['test']:.2%} on held-out "
                          f"data; worst experiment {st['max_exp']:.2%}; interestingness "
                          f"{e.scores['interestingness']:.2f}"
                          + (f"; dimensions {e.dim}" if e.dim != "n/a" else "") + "]")
+        for e in self.entries:
+            for w in e.warn:
+                lines.append(f"WARNING: {e.rel.text()}: {w}")
         lines += [f"note: {n}" for n in self.notes]
+        if self.engine.memory_summary:
+            lines.append(self.engine.memory_summary)
         return "\n".join(lines)
 
     def to_dict(self):
@@ -2192,7 +2761,8 @@ class Result:
                 scores={k: round(float(v), 4) for k, v in e.scores.items()},
                 error=dict(train=e.stats["train"], val=e.stats["val"], test=e.stats["test"],
                            per_experiment=[float(x) for x in e.stats["per_exp"]]),
-                dimensions=e.dim, parameters=list(e.params),
+                dimensions=e.dim, parameters=list(e.params), remembered=bool(e.recalled),
+                warnings=list(e.warn),
                 constants=[c.describe() for c in e.rel.cinfo if c is not None],
                 equivalent_forms=list(e.aliases)))
         return dict(counts=self.counts(), experiments=self.bundle.full.n_exp,
@@ -2241,7 +2811,7 @@ class Result:
 
 
 def discover(data, experiment=None, outputs=None, dims=None, base_dims=None, known=(),
-             seed=42, verbose=False, priors=False, **config):
+             seed=42, verbose=False, priors=False, memory=None, name="data", domain=None, **config):
     """Find relationships in observations.
 
         res = discover("run1.csv")                              # one experiment
@@ -2252,17 +2822,25 @@ def discover(data, experiment=None, outputs=None, dims=None, base_dims=None, kno
 
     `outputs`: readings you want on the left-hand side (display preference only).
     `priors`: allow recognising pi, e, ... (default: constants are learned from data only).
+    `memory`: path to a JSON file (or a Memory object). The engine re-validates what it learned
+              in earlier runs instead of rediscovering it, then writes new laws, constants,
+              falsified hypotheses and notes back to the file.
     """
     PRIORS["named"] = PRIORS["grammar"] = bool(priors)
     cfg = Config(seed=seed, verbose=verbose, **config)
     exps, notes = to_experiments(data, experiment)
     bundle = DataBundle(exps, cfg, dims, base_dims, outputs)
-    eng = Discoverer(bundle, cfg, known, "data")
+    mem = as_memory(memory)
+    if mem is not None and domain is not None:
+        mem.domain = domain
+    eng = Discoverer(bundle, cfg, known, name, memory=mem)
     eng.run()
-    return Result(eng, bundle, notes=notes)
+    eng.commit_memory()
+    return Result(eng, bundle, notes=notes, memory=mem)
 
 
-def explore(knobs, measure, seed=42, max_rounds=4, n0=200, priors=False, verbose=False):
+def explore(knobs, measure, seed=42, max_rounds=4, n0=200, priors=False, verbose=False,
+            memory=None, name="lab", domain=None):
     """Autonomous discovery on a real or simulated instrument.
 
         knobs   = {"temperature": (250, 600), "concentration": (0.1, 5)}   # name: (min, max), > 0
@@ -2279,10 +2857,14 @@ def explore(knobs, measure, seed=42, max_rounds=4, n0=200, priors=False, verbose
         return {**{k: np.asarray(v, float) for k, v in p.items()}, **out}
 
     lab = Lab(knobs, fn)
-    agent = Agent(lab, Config(seed=seed, verbose=verbose), rng, n0=n0, max_rounds=max_rounds)
+    mem = as_memory(memory)
+    if mem is not None and domain is not None:
+        mem.domain = domain
+    agent = Agent(lab, Config(seed=seed, verbose=verbose), rng, n0=n0, max_rounds=max_rounds,
+                  memory=mem, name=name)
     eng = agent.run()
     res = Result(eng, agent.bundle, agent.derived,
-                 [f"{lab.count} lab measurements used"])
+                 [f"{lab.count} lab measurements used"], memory=mem)
     res.agent = agent
     return res
 
@@ -2333,7 +2915,52 @@ def main():
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--memory", metavar="FILE",
+                    help="JSON memory file. Default for --csv/--lab: phy_memory.json. "
+                         "Benchmarks use none unless you pass this.")
+    ap.add_argument("--domain", default=None,
+                    help="memory partition: laws are only recalled inside the same domain "
+                         "(use when different projects reuse the same variable names)")
+    ap.add_argument("--no-memory", action="store_true", help="do not read or write any memory file")
+    ap.add_argument("--memory-show", action="store_true", help="print what the memory contains and exit")
+    ap.add_argument("--memory-notes", type=int, default=15, help="how many notes --memory-show prints")
+    ap.add_argument("--memory-forget", metavar="TEXT", help="delete remembered laws containing TEXT")
+    ap.add_argument("--memory-reset", action="store_true", help="delete the memory file")
+    ap.add_argument("--memory-demo", metavar="CHALLENGE",
+                    help="run a benchmark twice on a fresh memory and show the speed-up")
     a = ap.parse_args()
+    mpath = None if a.no_memory else (a.memory or "phy_memory.json")
+
+    if a.memory_reset:
+        import os
+        if os.path.exists(mpath or "phy_memory.json"):
+            os.remove(mpath or "phy_memory.json")
+        print("memory reset:", mpath or "phy_memory.json")
+        return
+    if a.memory_show or a.memory_forget:
+        m = Memory(mpath or "phy_memory.json")
+        if a.memory_forget:
+            n = m.forget(a.memory_forget)
+            m.save()
+            print(f"forgot {n} law(s) containing '{a.memory_forget}'")
+        print(m.describe(a.memory_notes))
+        return
+    if a.memory_demo:
+        import tempfile, os
+        PRIORS["named"] = PRIORS["grammar"] = a.priors
+        path = os.path.join(tempfile.mkdtemp(), "demo_memory.json")
+        rows = []
+        for k in (1, 2):
+            m = Memory(path, domain=a.memory_demo)
+            t0 = time.time()
+            ok = run_challenge(a.memory_demo, Config(seed=a.seed), a.seed, memory=m)
+            rows.append((k, time.time() - t0, ok))
+        print("\n" + "=" * 78 + "\nMEMORY DEMO (same challenge, same seed, same memory file)")
+        for k, sec, ok in rows:
+            print(f"  run {k}: {sec:5.1f}s  {'recovered' if ok else 'MISSED'}")
+        print(f"  speed-up: {rows[0][1] / max(rows[1][1], 1e-9):.1f}x\n")
+        print(Memory(path).describe(8))
+        return
 
     if a.lab_template:
         print(LAB_TEMPLATE)
@@ -2345,7 +2972,8 @@ def main():
             base = raw.pop("_base", None)
             dims = {k: tuple(v) for k, v in raw.items()}
         res = discover(a.csv, experiment=a.experiment_col, outputs=a.outputs, dims=dims,
-                       base_dims=base, seed=a.seed, verbose=a.verbose, priors=a.priors)
+                       base_dims=base, seed=a.seed, verbose=a.verbose, priors=a.priors,
+                       memory=mpath, name=",".join(a.csv)[:60], domain=a.domain)
         print(res.summary())
         if a.verbose:
             res.report()
@@ -2354,7 +2982,8 @@ def main():
         return
     if a.lab:
         knobs, measure = _load_lab(a.lab)
-        res = explore(knobs, measure, seed=a.seed, max_rounds=a.rounds, priors=a.priors)
+        res = explore(knobs, measure, seed=a.seed, max_rounds=a.rounds, priors=a.priors,
+                      memory=mpath, name=a.lab, domain=a.domain)
         print("\n" + "=" * 78 + "\n" + res.summary())
         if a.out:
             print("saved", res.save(a.out))
@@ -2378,7 +3007,9 @@ def main():
         if n == "latent":
             run_latent(cfg, a.seed)
         else:
-            res[n] = run_challenge(n, cfg, a.seed)
+            res[n] = run_challenge(n, cfg, a.seed,
+                                   memory=Memory(a.memory, domain=n) if (a.memory and not a.no_memory)
+                                   else None)
     print("\n" + "=" * 78 + "\nAUTONOMOUS BENCHMARK SUMMARY")
     for n, ok in res.items():
         print(f"  {n:10s} {'RECOVERED' if ok else 'MISSED'}")
