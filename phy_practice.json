@@ -1,0 +1,78 @@
+{
+ "version": 1,
+ "created": "2026-10-18T13:32:50",
+ "updated": "2026-10-18T13:33:07",
+ "runs": 1,
+ "laws": [],
+ "retired": [],
+ "falsified": [],
+ "constants": [],
+ "constant_relations": [],
+ "exponents": {},
+ "inventions": [],
+ "stages": {},
+ "notes": [
+  {
+   "t": "2026-10-18T13:33:07",
+   "kind": "run",
+   "text": "practice: 8/8 random worlds solved",
+   "count": 1
+  }
+ ],
+ "history": [
+  {
+   "t": "2026-10-18T13:33:07",
+   "dataset": "practice",
+   "variables": [],
+   "experiments": 0,
+   "rows": 0,
+   "recalled": 0,
+   "new": 0,
+   "search_seconds": 17.0
+  }
+ ],
+ "skills": {
+  "arrhenius": {
+   "attempts": 2,
+   "successes": 2,
+   "seconds": 0.9438166618347168,
+   "measurements": 2020,
+   "failed_noise": []
+  },
+  "gaussian": {
+   "attempts": 1,
+   "successes": 1,
+   "seconds": 1.5137701034545898,
+   "measurements": 1220,
+   "failed_noise": []
+  },
+  "log-index": {
+   "attempts": 1,
+   "successes": 1,
+   "seconds": 7.020605802536011,
+   "measurements": 1335,
+   "failed_noise": []
+  },
+  "sinusoid": {
+   "attempts": 1,
+   "successes": 1,
+   "seconds": 1.613245964050293,
+   "measurements": 1010,
+   "failed_noise": []
+  },
+  "exp-decay": {
+   "attempts": 2,
+   "successes": 2,
+   "seconds": 1.1240739822387695,
+   "measurements": 2020,
+   "failed_noise": []
+  },
+  "damped-oscillation": {
+   "attempts": 1,
+   "successes": 1,
+   "seconds": 4.163517951965332,
+   "measurements": 1490,
+   "failed_noise": []
+  }
+ }
+}
