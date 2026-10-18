@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 PHY_DISCOVER - single-file hypothesis-discovery engine + autonomous agent
 =========================================================================
@@ -15,6 +16,9 @@ Memory: pass a JSON file (`memory="phy_memory.json"` / `--memory`) and the engin
 re-validates remembered laws instead of rediscovering them, reuses learned constants,
 exponents and invented variables, remembers falsified hypotheses, and keeps notes.
 
+Part 4 (autopilot): scans for data, infers experiments/units/noise, writes reports, asks for the
+next measurements, watches a folder, and practises on worlds it invents when there is no data.
+
 Part 2 (agent): a lab-driven agent that designs its own experiments, INVENTS new
 variables (single-index search), learns exponents back into its vocabulary,
 falsifies its own hypotheses on fresh far-range measurements, and invents latent
@@ -26,12 +30,15 @@ Python:
     res = explore(knobs, measure)                    # autonomous agent on an instrument
 
 Command line:
-    python phy_discover.py --csv a.csv b.csv --out report.md      # your data
-    python phy_discover.py --csv all.csv --experiment-col run_id
-    python phy_discover.py --lab-template > my_lab.py             # describe an instrument
-    python phy_discover.py --lab my_lab.py --out report.md        # agent runs it
-    python phy_discover.py                                        # built-in benchmarks
-    python phy_discover.py --mode data --challenge law2           # V4-style benchmark
+    python phy_discover.py                      # AUTOPILOT: finds data in this folder, detects experiments,
+                                                #   units and noise level itself, discovers, and writes
+                                                #   phy_memory.json / phy_report.md / phy_report.json /
+                                                #   phy_next_experiments_*.csv
+    python phy_discover.py --watch              # keep running, re-analyse when files change
+    python phy_discover.py --practice 12        # self-directed practice on random worlds it invents
+    python phy_discover.py --csv a.csv b.csv    # explicit data;   --lab my_lab.py = run an instrument
+    python phy_discover.py --lab-template > my_lab.py
+    python phy_discover.py --challenge all      # built-in hidden-law self-test (simulated worlds)
 
 Requires: numpy only.
 """
@@ -568,13 +575,16 @@ def analyze(bundle, cfg):
     for v in bundle.variables:
         a = bundle.full.cols[v]
         pos = bool(np.all(a > 0))
-        varying = False
+        within = False
         for e in range(bundle.full.n_exp):
             s = a[bundle.full.exp_id == e]
-            varying |= (np.std(np.log(s)) > 1e-3) if pos else (np.std(s) > 1e-9)
+            within |= (np.std(np.log(s)) > 1e-3) if pos else (np.std(s) > 1e-9)
+        between = (np.std(np.log(a)) > 1e-3) if pos else (np.std(a) > 1e-9)
+        varying = bool(within or between)      # a value set once per experiment still varies
         span = math.log10(a.max() / a.min()) if pos else float("nan")
-        info[v] = dict(positive=pos, varying=bool(varying))
-        flags = ("log-able " if pos else "has<=0 ") + ("" if varying else "CONSTANT")
+        info[v] = dict(positive=pos, varying=varying, between_only=bool(between and not within))
+        flags = ("log-able " if pos else "has<=0 ") + ("" if varying else "CONSTANT") + \
+            ("set once per experiment" if info[v]["between_only"] else "")
         say(cfg, f"  {v:8s} {a.min():11.4g} {a.max():11.4g} {span:8.2f}  {flags}")
     return info
 
@@ -663,6 +673,9 @@ class PowerLawFinder:
                 if m.any():
                     c[m] -= c[m].mean()
             self.cent[v] = c
+        # globally centred logs: keep BETWEEN-experiment variation, so a variable that is set once per
+        # experiment (e.g. gravity per planet, temperature per run) can take part in a law
+        self.cent_g = {v: self.logs[v] - self.logs[v].mean() for v in self.vars}
         self.rng = np.random.default_rng(cfg.seed + 1)
         self.hints = []
         self.order = {v: i for i, v in enumerate(bundle.variables)}
@@ -672,8 +685,8 @@ class PowerLawFinder:
         _, s, vt = np.linalg.svd(X, full_matrices=False)
         return vt[-1], s
 
-    def fit_subset(self, sub):
-        X = np.column_stack([self.cent[v] for v in sub])
+    def fit_subset(self, sub, cent=None):
+        X = np.column_stack([(cent or self.cent)[v] for v in sub])
         mask = np.ones(len(X), bool)
         for _ in range(4):
             p, _ = self._null(X[mask])
@@ -809,7 +822,7 @@ class PowerLawFinder:
         cands = []
         for size in range(2, self.cfg.max_subset + 1):
             for sub in itertools.combinations(self.vars, size):
-                c = self.fit_subset(sub)
+                c = self.fit_subset(sub, self.cent_g) or self.fit_subset(sub)
                 if c:
                     cands.append(c)
                     found.add(sub)
@@ -820,6 +833,17 @@ class PowerLawFinder:
                 continue
             rel, spread, exp_info, committee = res
             st = evaluate_relation(rel, self.b)
+            # A power law is one relation however it is written (g = 40 L/T^2 is T = 0.16 sqrt(L g^-1)...),
+            # but its relative error is larger when the left side has a large exponent on the noisy
+            # variable. Judge it in the most noise-sensitive orientation, not the one we happened to print.
+            big = max([1.0] + [abs(e) for e in rel.rhs[0][1].exps.values()])
+            if big > 1.0:
+                for key in ("train", "val", "test", "max_exp"):
+                    st[key] = st[key] / big
+                st["per_exp"] = [x / big for x in st["per_exp"]]
+                exp_info = list(exp_info) + [f"(error shown in the most noise-sensitive orientation, "
+                                             f"i.e. divided by {big:g} as for this equation written with "
+                                             f"the largest-exponent variable on the left)"]
             if accept(st, self.cfg):
                 kind = "power-law"
                 entries.append(Entry(rel, kind, st, spread, exp_info, committee))
@@ -1258,8 +1282,12 @@ class PeriodicScan:
 
     @staticmethod
     def _interval(grid, rss, n):
+        if not np.all(np.isfinite(rss)):
+            return float("inf")
         rmin = rss.min()
         inside = grid[rss <= rmin * (1 + 1.0 / max(n - 7, 1))]
+        if inside.size == 0:
+            return float("inf")
         return max((inside.max() - inside.min()) / 2, 1e-12)
 
     def _peaks(self, x, y, max_peaks, extra):
@@ -1281,6 +1309,8 @@ class PeriodicScan:
             ws = np.exp(np.linspace(math.log(lo), math.log(hi), 320))
             zero = np.zeros_like(ws)
             rss = self._rss_grid(ws, zero, x, yr, Q, wgt)
+            if not np.all(np.isfinite(rss)):
+                break
             k0 = int(np.argmin(rss))
             if rss[k0] > 0.9 * rss0:                         # nothing periodic here: stop early
                 break
@@ -1312,6 +1342,8 @@ class PeriodicScan:
             rmin = float(r3.min())
             w0 = fine[int(np.argmin(r3))]
             se_w = self._interval(fine, r3, n)
+            if not math.isfinite(se_w):
+                break
             se_k = 0.0
             if k > 0:
                 kf = np.linspace(k * 0.7, k * 1.3, 601)
@@ -1328,8 +1360,8 @@ class PeriodicScan:
         tr = self.b.train
         y, x = tr.cols[t], tr.cols[v]
         ok = np.isfinite(y) & np.isfinite(x) & (np.abs(y) > 1e-12)
-        if ok.sum() < 80 or np.ptp(x[ok]) <= 0:
-            return []
+        if ok.sum() < 80 or np.ptp(x[ok]) <= 0 or len(np.unique(np.round(x[ok], 12))) < 15:
+            return []          # periodicity needs a continuously varied input (>= 15 distinct values)
         extra = []
         for u in self.varying:
             if u in (t, v):
@@ -1394,7 +1426,7 @@ class Archive:
 
     @staticmethod
     def _mono_vec(rel):
-        if len(rel.rhs) != 1 or rel.lhs.kind != "m" or rel.rhs[0][1].kind != "m":
+        if len(rel.rhs) != 1 or rel.lhs.kind != "m" or rel.rhs[0][1].kind not in ("m", "em"):
             return None
         c, f = rel.rhs[0]
         if c <= 0:
@@ -1402,13 +1434,19 @@ class Archive:
         p = dict(rel.lhs.exps)
         for v, e in f.exps.items():
             p[v] = p.get(v, 0) - e
+        if f.kind == "em":                      # exp(q v^k) factors are extra "log-space" coordinates
+            for (v, k), q in f.ex.items():
+                p[f"exp:{v}^{k}"] = p.get(f"exp:{v}^{k}", 0) - q
         return p, math.log(c)
 
     def _mono_class(self, p, logc):
         if not self.mono:
             return "NOVEL", None
-        vp = np.array([p.get(v, 0) for v in self.vars])
-        M = np.array([[q.get(v, 0) for v in self.vars] for q, _ in self.mono])
+        keys = sorted(set(p) | {k for q, _ in self.mono for k in q})
+        scale = np.array([max([abs(p.get(k, 0))] + [abs(q.get(k, 0)) for q, _ in self.mono]) or 1.0
+                          for k in keys])                 # exp-rates (~1000) and exponents (~1) comparable
+        vp = np.array([p.get(k, 0) for k in keys]) / scale
+        M = np.array([[q.get(k, 0) for k in keys] for q, _ in self.mono]) / scale
         for k, (q, lc) in enumerate(self.mono):
             u = M[k]
             s = (vp @ u) / (u @ u)
@@ -1579,7 +1617,7 @@ class Memory:
         return {"version": self.VERSION, "created": t, "updated": t, "runs": 0,
                 "laws": [], "retired": [], "falsified": [], "constants": [],
                 "constant_relations": [], "exponents": {}, "inventions": [],
-                "stages": {}, "notes": [], "history": []}
+                "stages": {}, "notes": [], "history": [], "skills": {}}
 
     def _load(self):
         try:
@@ -1828,6 +1866,19 @@ class Memory:
             return True
         return False
 
+    def record_skill(self, family, ok, seconds, measurements, noise):
+        s = self.data["skills"].setdefault(family, dict(attempts=0, successes=0, seconds=0.0,
+                                                        measurements=0, failed_noise=[]))
+        s["attempts"] += 1
+        s["successes"] += int(ok)
+        s["seconds"] += float(seconds)
+        s["measurements"] += int(measurements)
+        if not ok:
+            s["failed_noise"] = (s["failed_noise"] + [round(float(noise), 4)])[-8:]
+        if s["attempts"] >= 4 and s["successes"] / s["attempts"] < 0.75:
+            self.note("weakness", f"finds '{family}' laws only {s['successes']}/{s['attempts']} times "
+                                  f"(failed at noise {s['failed_noise']}) - treat such results with care")
+
     def record_run(self, **info):
         self.data["runs"] += 1
         self.data["history"].append(dict(t=self._now(), **_plain(info)))
@@ -1852,6 +1903,9 @@ class Memory:
             L.append("   stage stats: " + "; ".join(
                 f"{k}: {v['accepted']} accepted / {v['runs']} runs / {v['seconds']:.1f}s"
                 for k, v in d["stages"].items()))
+        if d.get("skills"):
+            L.append("   skills (own practice): " + "; ".join(
+                f"{k} {v['successes']}/{v['attempts']}" for k, v in sorted(d["skills"].items())))
         L.append("  recent notes:")
         for n in d["notes"][-notes:]:
             L.append(f"   - [{n['kind']}] {n['text']}" + (f"  (x{n['count']})" if n["count"] > 1 else ""))
@@ -2013,6 +2067,13 @@ class Discoverer:
         pool2 = imp.run()
         self._stage("implicit", t_, len(pool2))
         pool2.sort(key=lambda e: (round(e.rel.complexity(), 1), e.stats["train"]))
+        if b.dims:        # units known: a sum of terms with different dimensions is not physics
+            bad = [e for e in pool2 if dim_status(e.rel, b).startswith("INCONSISTENT")]
+            if bad:
+                say(cfg, f"  [UNITS] rejected {len(bad)} relation(s) whose terms have different dimensions")
+                if mem:
+                    mem.note("lesson", f"rejected dimensionally inconsistent relation(s), e.g. {bad[0].rel.text()}")
+                pool2 = [e for e in pool2 if e not in bad]
         say(cfg, f"  {len(pool2)} accepted candidates")
         for e in pool2:
             if not e.rel.lhs.exps:      # "1 = f(...)" over exactly the variables of an accepted law
@@ -2175,9 +2236,10 @@ class ActiveDesigner:
             out.append((r, err))
         return out
 
-    def propose(self, archive, k=6, replicates=10):
+    def propose(self, archive, k=6, replicates=10, only=None):
         cands = []
-        for e in archive.ranked():
+        self.last_sep = []
+        for e in ([only] if only is not None else archive.ranked()):
             r = e.rel
             if e.cls in ("NOVEL", "KNOWN") and r.is_explicit():
                 tgt = r.lhs_var()
@@ -2236,6 +2298,7 @@ class ActiveDesigner:
         for c in chosen:
             print("    " + "  ".join(f"{v}={pts[v][c]:.4g}" for v in self.ctrl)
                   + f"   -> separation {sep[c]:.1f} sigma")
+        self.last_sep = [float(sep[c]) for c in chosen for _ in range(replicates)]
         sel = {v: np.repeat(pts[v][chosen], replicates) for v in self.ctrl}
         return sel, e
 
@@ -3093,7 +3156,8 @@ class Result:
 
 
 def discover(data, experiment=None, outputs=None, dims=None, base_dims=None, known=(),
-             seed=42, verbose=False, priors=False, memory=None, name="data", domain=None, **config):
+             seed=42, verbose=False, priors=False, memory=None, name="data", domain=None,
+             commit=True, **config):
     """Find relationships in observations.
 
         res = discover("run1.csv")                              # one experiment
@@ -3117,7 +3181,8 @@ def discover(data, experiment=None, outputs=None, dims=None, base_dims=None, kno
         mem.domain = domain
     eng = Discoverer(bundle, cfg, known, name, memory=mem)
     eng.run()
-    eng.commit_memory()
+    if commit:
+        eng.commit_memory()
     return Result(eng, bundle, notes=notes, memory=mem)
 
 
@@ -3176,6 +3241,631 @@ def _load_lab(path):
     return mod.KNOBS, mod.measure
 
 
+# #############################################################################
+# PART 4: AUTOPILOT - finds the data, works out its structure, and runs everything itself
+#
+#   python phy_discover.py            -> scans the current folder for data files, then
+#                                        detects experiments (many files, or a label column),
+#                                        drops index/duplicate columns, reads units from headers
+#                                        like "g [m/s^2]", picks the noise tolerance by itself,
+#                                        discovers laws, asks for the measurements it would need
+#                                        next, and WRITES: phy_memory.json, phy_report.md,
+#                                        phy_report.json, phy_next_experiments_*.csv
+#   --watch                           -> keeps running and re-analyses when files appear/change
+#   (no data found)                   -> self-directed practice: invents its own random worlds,
+#                                        tries to discover them, records which kinds of law it
+#                                        can/cannot find in phy_practice.json (self-assessment)
+# #############################################################################
+import contextlib as _ctx
+import io as _io
+import re as _re
+
+DATA_EXT = (".csv", ".tsv", ".txt", ".json", ".npz")
+OWN_PREFIX = "phy_"
+LABEL_HINTS = ("run", "trial", "exp", "session", "batch", "group", "series", "sample", "condition",
+               "setup", "campaign", "case", "dataset", "planet", "material", "id")
+BASE_UNITS = ["M", "L", "T", "K", "A", "mol"]
+_Z = (0, 0, 0, 0, 0, 0)
+
+
+def _dim(M=0, L=0, T=0, K=0, A=0, N=0):
+    return (M, L, T, K, A, N)
+
+
+_UNITS = {
+    "m": _dim(L=1), "s": _dim(T=1), "g": _dim(M=1), "kg": _dim(M=1), "K": _dim(K=1), "A": _dim(A=1),
+    "mol": _dim(N=1), "Hz": _dim(T=-1), "N": _dim(1, 1, -2), "Pa": _dim(1, -1, -2),
+    "J": _dim(1, 2, -2), "W": _dim(1, 2, -3), "V": _dim(1, 2, -3, 0, -1), "C": _dim(T=1, A=1),
+    "min": _dim(T=1), "h": _dim(T=1), "hr": _dim(T=1), "day": _dim(T=1), "d": _dim(T=1),
+    "L": _dim(L=3), "bar": _dim(1, -1, -2), "atm": _dim(1, -1, -2), "psi": _dim(1, -1, -2),
+    "eV": _dim(1, 2, -2), "ohm": _dim(1, 2, -3, 0, -2), "Ω": _dim(1, 2, -3, 0, -2),
+    "degC": _dim(K=1), "°C": _dim(K=1), "rad": _Z, "deg": _Z, "°": _Z, "%": _Z,
+}
+_PREFIX = set("pnumcdkMGT")
+
+
+def _unit_dim(sym):
+    if sym in _UNITS:
+        return _UNITS[sym]
+    if len(sym) > 1 and sym[0] in _PREFIX and sym[1:] in _UNITS and sym not in ("min", "mol"):
+        return _UNITS[sym[1:]]
+    return None
+
+
+def parse_units(text):
+    """'m/s^2' -> dimension vector over (M, L, T, K, A, mol); None if any symbol is unknown."""
+    t = text.strip().replace("·", "*").replace("²", "^2").replace("³", "^3").replace("µ", "u")
+    t = t.replace("⁻¹", "^-1").replace("**", "^")
+    if t in ("", "1", "-", "dimensionless", "unitless", "none"):
+        return _Z
+    t = _re.sub(r"/\(([^)]*)\)", lambda m: "/" + "/".join(_re.split(r"[*\s]+", m.group(1).strip())), t)
+    vec = np.zeros(6)
+    used = 0
+    for m in _re.finditer(r"([*/\s]*)([A-Za-z°ΩΩ%]+)(?:\^(-?\d+(?:\.\d+)?)|(-?\d+(?:\.\d+)?))?", t):
+        ops, sym = m.group(1), m.group(2)
+        ex = m.group(3) or m.group(4)
+        d = _unit_dim(sym)
+        if d is None:
+            return None
+        vec += (-1 if "/" in ops else 1) * (float(ex) if ex else 1.0) * np.array(d, float)
+        used += 1
+    return tuple(float(v) for v in vec) if used else None
+
+
+def split_header(h):
+    """'g [m/s^2]' -> ('g', 'm/s^2');  'T_K' -> ('T_K', None)."""
+    m = _re.match(r"^(.*?)\s*[\[\(]([^\]\)]*)[\]\)]\s*$", str(h).strip())
+    name, unit = (m.group(1), m.group(2)) if m else (str(h).strip(), None)
+    name = _re.sub(r"\W+", "_", name).strip("_") or "col"
+    if name[0].isdigit():
+        name = "v_" + name
+    return name, unit
+
+
+def _coerce(values):
+    """list of cells -> float array (stray 'n/a' = nan) or an object array of strings."""
+    vals = [("" if v is None else str(v)).strip() for v in values]
+    parsed, bad, filled = [], 0, 0
+    for v in vals:
+        if v == "":
+            parsed.append(np.nan)
+            continue
+        filled += 1
+        try:
+            parsed.append(float(v.replace(",", ".") if _re.fullmatch(r"-?\d+,\d+", v) else v))
+        except ValueError:
+            parsed.append(np.nan)
+            bad += 1
+    if filled and bad <= 0.2 * filled:
+        return np.array(parsed)
+    return np.array(vals, dtype=object)
+
+
+def load_any(path):
+    """csv / tsv / txt (delimiter sniffed) / json (records or columns) / npz  ->  {column: array}."""
+    low = path.lower()
+    if low.endswith(".json"):
+        with open(path) as f:
+            obj = json.load(f)
+        if isinstance(obj, dict):
+            return {k: _coerce(v) for k, v in obj.items() if isinstance(v, list)}
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            return {k: _coerce([r.get(k) for r in obj]) for k in obj[0]}
+        raise ValueError("json must be a list of records or a dict of columns")
+    if low.endswith(".npz"):
+        d = np.load(path, allow_pickle=False)
+        return {k: np.asarray(d[k], float) for k in d.files if d[k].ndim == 1}
+    with open(path, newline="", encoding="utf-8-sig", errors="replace") as f:
+        text = f.read()
+    sample = text[:4096]
+    try:
+        delim = csv.Sniffer().sniff(sample, delimiters=",;\t| ").delimiter
+    except csv.Error:
+        delim = "\t" if low.endswith(".tsv") else ","
+    rows = [r for r in csv.reader(text.splitlines(), delimiter=delim) if any(c.strip() for c in r)]
+    if len(rows) < 3:
+        raise ValueError("fewer than 3 rows")
+    head = rows[0]
+    numeric_head = sum(1 for c in head if _coerce([c]).dtype != object)
+    if numeric_head >= max(2, len(head) - 0):            # first row is data: no header
+        head, body = [f"c{i + 1}" for i in range(len(head))], rows
+    else:
+        body = rows[1:]
+    cols = {}
+    for j, h in enumerate(head):
+        cols[h.strip() or f"c{j + 1}"] = _coerce([r[j] if j < len(r) else "" for r in body])
+    return cols
+
+
+def scan_data_files(directory, recursive=False):
+    out = []
+    for root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "node_modules")]
+        for f in sorted(files):
+            if f.startswith(OWN_PREFIX) or f.startswith(".") or not f.lower().endswith(DATA_EXT):
+                continue
+            out.append(os.path.join(root, f))
+        if not recursive:
+            break
+    return out
+
+
+def _is_index_like(name, col):
+    c = np.asarray(col, float)
+    if not np.all(np.isfinite(c)) or len(c) < 5:
+        return False
+    if name.lower() in ("index", "idx", "row", "rownum", "unnamed", "id", "n", "no"):
+        if np.all(c == np.round(c)) and len(np.unique(c)) == len(c):
+            return True
+    d = np.diff(c)
+    return bool(np.all(c == np.round(c)) and np.all(d == 1))
+
+
+def _find_label_column(table):
+    best = None
+    for name, col in table.items():
+        arr = np.asarray(col)
+        hint = any(h in name.lower() for h in LABEL_HINTS)
+        if arr.dtype == object:
+            vals = [str(v) for v in arr.tolist() if str(v) != ""]
+            score = 2
+        else:
+            a = arr.astype(float)
+            if not np.all(np.isfinite(a)) or not np.all(a == np.round(a)) or not hint:
+                continue
+            vals = a.tolist()
+            score = 1
+        keys = list(dict.fromkeys(vals))
+        if not (2 <= len(keys) <= 40):
+            continue
+        sizes = [sum(1 for v in vals if v == k) for k in keys]
+        if min(sizes) < 30:
+            continue
+        cand = (score + (1 if hint else 0), -len(keys), name)
+        if best is None or cand > best:
+            best = cand
+    return best[2] if best else None
+
+
+def auto_prepare(group):
+    """group: [(source, table)] with a shared schema.
+    -> (experiments [dict], names, dims or None, decisions [str])"""
+    dec, dims = [], {}
+    tabs = []
+    for src, table in group:
+        ren, seen = {}, set()
+        for h in table:
+            name, unit = split_header(h)
+            base, k = name, 2
+            while name in seen:
+                name, k = f"{base}_{k}", k + 1
+            seen.add(name)
+            ren[h] = name
+            if unit is not None:
+                d = parse_units(unit)
+                if d is not None:
+                    dims.setdefault(name, d)
+                else:
+                    dec.append(f"header '{h}': unit '{unit}' not recognised - dimensions skipped for it")
+        tabs.append((src, {ren[h]: v for h, v in table.items()}))
+    experiments, names = [], []
+    if len(tabs) >= 2:
+        for src, t in tabs:
+            experiments.append(t)
+            names.append(os.path.basename(src))
+        dec.append(f"{len(tabs)} files share a schema -> treated as {len(tabs)} separate experiments")
+    else:
+        src, t = tabs[0]
+        lab = _find_label_column(t)
+        if lab:
+            tags = np.asarray(t[lab])
+            keys = list(dict.fromkeys(tags.tolist()))
+            for k in keys:
+                m = tags == k
+                experiments.append({c: np.asarray(v)[m] for c, v in t.items() if c != lab})
+                names.append(f"{lab}={k}")
+            dec.append(f"column '{lab}' labels {len(keys)} groups of >=30 rows -> treated as "
+                       f"{len(keys)} separate experiments")
+        else:
+            experiments.append(t)
+            names.append(os.path.basename(src))
+            dec.append("no experiment-label column found -> one experiment (generality cannot be verified)")
+    # numeric columns shared by all experiments
+    common = None
+    for e in experiments:
+        num = {c for c, v in e.items() if np.asarray(v).dtype != object}
+        common = num if common is None else common & num
+    order = [c for c in experiments[0] if c in common]
+    dropped = [c for c in experiments[0] if c not in common]
+    if dropped:
+        dec.append(f"ignored non-numeric/unshared columns: {dropped}")
+    idx = [c for c in order if all(_is_index_like(c, e[c]) for e in experiments)]
+    if idx:
+        dec.append(f"dropped index-like columns {idx}")
+        order = [c for c in order if c not in idx]
+    # exact scaled copies (b = k*a): trivial definitions, not discoveries
+    pooled = {c: np.concatenate([np.asarray(e[c], float) for e in experiments]) for c in order}
+    copies = {}
+    for i, a in enumerate(order):
+        for b in order[i + 1:]:
+            if a in copies or b in copies:
+                continue
+            A, B = pooled[a], pooled[b]
+            ok = np.isfinite(A) & np.isfinite(B) & (np.abs(A) > 1e-300)
+            if ok.sum() > 10 and np.all(np.abs(A[ok]) > 0):
+                r = B[ok] / A[ok]
+                if abs(np.mean(r)) > 0 and np.std(r) / abs(np.mean(r)) < 1e-7:
+                    copies[b] = (a, float(np.mean(r)))
+    for b, (a, k) in copies.items():
+        dec.append(f"column '{b}' is an exact copy of '{a}' (x{k:.6g}) -> removed from the search")
+    order = [c for c in order if c not in copies]
+    experiments = [{c: np.asarray(e[c], float) for c in order} for e in experiments]
+    dd = {c: d for c, d in dims.items() if c in order}
+    if len(dd) >= 2:
+        dec.append(f"units read from headers for {sorted(dd)} -> dimensional analysis on")
+    else:
+        dd = None
+    return experiments, names, dd, dec
+
+
+def _group_tables(tables):
+    groups = []
+    for src, t in tables:
+        cols = {split_header(h)[0] for h, v in t.items() if np.asarray(v).dtype != object}
+        for g in groups:
+            if len(cols & g["cols"]) / max(1, len(cols | g["cols"])) >= 0.7:
+                g["items"].append((src, t))
+                g["cols"] &= cols
+                break
+        else:
+            groups.append(dict(items=[(src, t)], cols=set(cols)))
+    return groups
+
+
+def noise_ladder():
+    return (0.02, 0.05, 0.10)
+
+
+def reorient_power_law(rel, w):
+    """lhs = c * prod v^q  ->  the same law solved for variable w (None if not a pure power law)."""
+    if len(rel.rhs) != 1 or rel.lhs.kind != "m" or rel.rhs[0][1].kind != "m" or not rel.is_explicit():
+        return None
+    c, f = rel.rhs[0]
+    lv = rel.lhs_var()
+    if c <= 0:
+        return None
+    if w == lv:
+        return rel
+    r = dict(f.exps)
+    r[lv] = -1.0
+    if w not in r or abs(r[w]) < 1e-12:
+        return None
+    new = {j: -r[j] / r[w] for j in r if j != w}
+    return Relation(Feature.mono({w: 1}), [(c ** (-1.0 / r[w]), Feature.mono(new))])
+
+
+def _most_sensitive(rel):
+    """the variable of a pure power law with the largest exponent: the one measurement noise hurts most."""
+    if len(rel.rhs) != 1 or rel.rhs[0][1].kind != "m" or not rel.is_explicit():
+        return None
+    r = dict(rel.rhs[0][1].exps)
+    r[rel.lhs_var()] = 1.0
+    return max(r, key=lambda v: (abs(r[v]), v == rel.lhs_var()))
+
+
+def make_proposals(res, out_dir, tag, seed, k=8, limit=3):
+    """Ask for the measurements that would best tell the surviving hypotheses apart."""
+    arch, b = res.engine.archive, res.bundle
+    files, done = [], set()
+    for e in arch.ranked():
+        if e.cls not in ("NOVEL", "KNOWN") or not e.rel.is_explicit() or len(files) >= limit:
+            continue
+        w = _most_sensitive(e.rel)
+        rel2 = reorient_power_law(e.rel, w) if w else None
+        ent = e
+        if rel2 is not None and rel2 is not e.rel:      # propose: set the others, MEASURE the sensitive one
+            ent = Entry(rel2, "reoriented", e.stats, e.spread, [], [reorient_power_law(c, w) or c
+                                                                  for c in e.committee])
+            ent.cls = "NOVEL"
+        tgt = ent.rel.lhs_var()
+        ctrl = sorted(ent.rel.variables() - {tgt})
+        if tgt in done or not ctrl:
+            continue
+        done.add(tgt)
+        d = ActiveDesigner(b, Config(seed=seed, verbose=False), ctrl)
+        with _ctx.redirect_stdout(_io.StringIO()):
+            prop = d.propose(arch, k=k, replicates=1, only=ent)
+        if not prop:
+            continue
+        sel, _ = prop
+        pred = ent.rel.rhs_value(sel)
+        e = ent
+        path = os.path.join(out_dir, f"phy_next_experiments_{tag}_{tgt}.csv")
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(ctrl + [f"predicted_{tgt}", "separation_sigma"])
+            for i in range(len(pred)):
+                w.writerow([f"{sel[v][i]:.6g}" for v in ctrl] + [f"{pred[i]:.6g}",
+                                                                  f"{d.last_sep[i]:.2f}"])
+        files.append((path, e.rel.text()))
+    return files
+
+
+def self_assessment(path):
+    if not os.path.exists(path):
+        return []
+    try:
+        sk = json.load(open(path)).get("skills", {})
+    except Exception:
+        return []
+    rows = []
+    for fam, s in sorted(sk.items()):
+        if s["attempts"] >= 3:
+            rows.append((fam, s["successes"], s["attempts"]))
+    return rows
+
+
+def analyze_group(label, group, out_dir, mem, seed, tag, log):
+    exps, names, dims, dec = auto_prepare(group)
+    for d in dec:
+        log(f"   [auto] {d}")
+    chosen = None
+    for tol in noise_ladder():
+        res = discover(exps, dims=dims, base_dims=BASE_UNITS if dims else None, memory=mem,
+                       name=label, seed=seed, commit=False, accept_err=tol, log_fit_tol=tol)
+        found = [e for e in res.entries if e.cls in ("NOVEL", "KNOWN")]
+        if found or tol == noise_ladder()[-1]:
+            chosen = (tol, res)
+            break
+        msg = f"no relationship met the {tol:.0%} accuracy bar -> relaxing (noisy data?)"
+        dec.append(msg)
+        log(f"   [auto] {msg}")
+    tol, res = chosen
+    if tol > noise_ladder()[0] and any(e.cls in ("NOVEL", "KNOWN") for e in res.entries):
+        dec.append(f"accuracy bar set to {tol:.0%} (data noisier than the default)")
+        log(f"   [auto] accuracy bar set to {tol:.0%}")
+    elif not any(e.cls in ("NOVEL", "KNOWN") for e in res.entries):
+        dec.append("nothing held up even at the loosest accuracy bar (10%): treat the data as unrelated, "
+                   "too noisy, or outside the search vocabulary")
+        log("   [auto] nothing held up even at the loosest accuracy bar (10%)")
+    res.engine.commit_memory(context=dict(tolerance=tol), notes=[d for d in dec][:5])
+    res.notes = list(res.notes) + [f"autopilot: {d}" for d in dec]
+    props = make_proposals(res, out_dir, tag, seed)
+    return dict(label=label, decisions=dec, tolerance=tol, result=res, proposals=props, names=names)
+
+
+def write_artifacts(out_dir, analyses, practice_rows, created):
+    md = ["# phy_discover autopilot report", "",
+          f"generated {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
+    js = []
+    for a in analyses:
+        res = a["result"]
+        md += [f"## Dataset: {a['label']}", "", "### What the autopilot decided", ""]
+        md += [f"- {d}" for d in a["decisions"]] or ["- nothing special"]
+        md += [f"- accuracy bar used: {a['tolerance']:.0%}", ""]
+        body = res.to_markdown().splitlines()
+        md += ["##" + l if l.startswith("#") else l for l in body]
+        if a["proposals"]:
+            md += ["", "### Measurements it asks you to take next", ""]
+            md += [f"- `{os.path.basename(p)}`  -  tests `{t}`" for p, t in a["proposals"]]
+        md.append("")
+        js.append(dict(dataset=a["label"], decisions=a["decisions"], tolerance=a["tolerance"],
+                       result=res.to_dict(), next_experiments=[p for p, _ in a["proposals"]]))
+    if practice_rows:
+        md += ["## Self-assessment (from its own practice runs)", "",
+               "| kind of law | found / tried |", "|---|---|"]
+        md += [f"| {f} | {s}/{n} |" for f, s, n in practice_rows]
+        md.append("")
+    p1, p2 = os.path.join(out_dir, "phy_report.md"), os.path.join(out_dir, "phy_report.json")
+    with open(p1, "w") as f:
+        f.write("\n".join(md))
+    with open(p2, "w") as f:
+        json.dump(_plain(js), f, indent=1)
+    created += [p1, p2]
+
+
+# ---------------------------------------------------------------- practice ----
+FAMILIES = ["power", "sum-of-products", "exp-decay", "arrhenius", "gaussian", "sinusoid",
+            "damped-oscillation", "composite-index", "log-index"]
+
+
+def _r2(x):
+    return float(f"{x:.2g}")
+
+
+def random_world(rng, family=None):
+    """A random hidden law the program writes for itself (the engine is never shown it)."""
+    fam = family or str(rng.choice(FAMILIES))
+    U = lambda a, b: float(rng.uniform(a, b))
+    out = str(rng.choice(["P", "Q", "R", "S", "W", "Y"]))
+    knobs = {"x": (0.5, 20), "y": (0.5, 15), "z": (0.5, 10)}
+    M = lambda c, **e: (c, Feature.mono(e))
+    O = (1, Feature.mono({out: 1}))
+    if fam == "power":
+        p1, p2 = [float(rng.choice([-2, -1, -0.5, 0.5, 1, 1.5, 2, 3])) for _ in range(2)]
+        if rng.random() < 0.4:
+            p1 = round(U(0.4, 2.5), 2)
+        C = _r2(10 ** U(-1, 2))
+        fn = lambda p: C * p["x"] ** p1 * p["y"] ** p2
+        truth = [O, M(-C, x=p1, y=p2)]
+    elif fam == "sum-of-products":
+        C1 = _r2(10 ** U(0, 1.3))
+        C2 = _r2(C1 * U(2, 20))
+        fn = lambda p: C1 * p["x"] * p["y"] + C2 * p["z"]
+        truth = [O, M(-C1, x=1, y=1), M(-C2, z=1)]
+    elif fam == "exp-decay":
+        knobs = {"x": (0.2, 8), "z": (0.5, 10)}
+        C, pz, k = _r2(10 ** U(0, 1.5)), float(rng.choice([0.5, 1, 1.5, 2])), _r2(U(0.15, 0.6))
+        fn = lambda p: C * p["z"] ** pz * np.exp(-k * p["x"])
+        truth = [O, (-C, Feature.em({"z": pz}, {("x", 1): -k}))]
+    elif fam == "arrhenius":
+        knobs = {"T": (250, 600), "c": (0.1, 5)}
+        C, pc, E = _r2(10 ** U(3, 5)), float(rng.choice([1, 1.5, 2])), float(round(U(1000, 4000), -2))
+        fn = lambda p: C * p["c"] ** pc * np.exp(-E / p["T"])
+        truth = [O, (-C, Feature.em({"c": pc}, {("T", -1): -E}))]
+    elif fam == "gaussian":
+        knobs = {"x": (0.2, 8), "z": (0.5, 10)}
+        A, mu, s = _r2(10 ** U(0, 1.5)), round(U(2, 6), 1), round(U(1, 2.2), 1)
+        fn = lambda p: A * np.exp(-(p["x"] - mu) ** 2 / (2 * s * s))
+        truth = [O, (-A * math.exp(-mu * mu / (2 * s * s)),
+                     Feature.em({}, {("x", 1): mu / (s * s), ("x", 2): -1 / (2 * s * s)}))]
+    elif fam in ("sinusoid", "damped-oscillation"):
+        knobs = {"x": (0.2, 8), "z": (0.5, 10)}
+        c0 = _r2(10 ** U(0.6, 1.2))
+        a, w, ph = _r2(U(0.2, 0.6) * c0), round(U(1.2, 4), 1), round(U(0, 2), 1)
+        k = _r2(U(0.15, 0.4)) if fam == "damped-oscillation" else 0.0
+        env = (lambda x: np.exp(-k * x)) if k else (lambda x: 1.0)
+        fn = lambda p: c0 + a * env(p["x"]) * np.sin(w * p["x"] + ph)
+        truth = [O, M(-c0), (-a * math.cos(ph), Feature.trig("sin", "x", w, k)),
+                 (-a * math.sin(ph), Feature.trig("cos", "x", w, k))]
+    elif fam == "composite-index":
+        C1, C2 = _r2(10 ** U(0, 1)), _r2(10 ** U(0, 1))
+        u = lambda p: p["x"] * p["y"] / p["z"] ** 2
+        fn = lambda p: C1 * u(p) ** 1.5 + C2 * u(p)
+        truth = [O, M(-C1, x=1.5, y=1.5, z=-3), M(-C2, x=1, y=1, z=-2)]
+    else:                                                    # log-index
+        c1 = _r2(U(1, 4))
+        c0 = _r2(7 * c1 + U(5, 20))
+        fn = lambda p: c0 + c1 * np.log(p["x"] * p["y"] / p["z"] ** 2)
+        truth = [O, M(-c0), (-c1, Feature.log("x")), (-c1, Feature.log("y")), (2 * c1, Feature.log("z"))]
+    noise = U(0.001, 0.008)
+
+    def make(rng2):
+        def f(p):
+            cols = dict(p)
+            cols[out] = _noisy(rng2, fn(p), noise)
+            return cols
+        return Lab(knobs, f)
+    return fam, make, truth, noise
+
+
+def _truth_hit(eng, derived, terms):
+    ents = [e for e in eng.archive.all if e.cls != "DEFINITION"]
+    if any(terms_match(expand_terms(e.rel, derived), terms) for e in ents):
+        return True
+    if len(terms) == 2 and all(f.kind == "m" for _, f in terms) and eng.archive.mono:
+        tm = Archive._mono_vec(Relation(terms[0][1], [(-terms[1][0], terms[1][1])]))
+        if tm is not None and tm[0]:
+            return eng.archive._mono_class(*tm)[0] in ("DERIVED", "REDUNDANT")
+    return False
+
+
+def practice(n_worlds, seed, mem, say, time_budget=120.0):
+    """Self-directed practice: random worlds -> autonomous agent -> self-scored."""
+    t_start, rows = time.time(), []
+    rng = np.random.default_rng(seed)
+    for k in range(n_worlds):
+        if time.time() - t_start > time_budget:
+            say(f"   [practice] time budget reached after {k} worlds")
+            break
+        wseed = int(rng.integers(1, 10 ** 6))
+        fam, make, truth, noise = random_world(np.random.default_rng(wseed))
+        lab = make(np.random.default_rng(wseed + 1))
+        t0 = time.time()
+        agent = Agent(lab, Config(seed=wseed), np.random.default_rng(wseed + 2))
+        with _ctx.redirect_stdout(_io.StringIO()):
+            eng = agent.run()
+        ok = _truth_hit(eng, agent.derived, truth)
+        secs = time.time() - t0
+        rows.append((fam, ok, secs, lab.count, noise))
+        say(f"   [practice {k + 1}/{n_worlds}] {fam:20s} noise {noise:.2%}  "
+            f"{'FOUND' if ok else 'missed'}  ({secs:.1f}s, {lab.count} measurements)")
+        if mem is not None:
+            mem.record_skill(fam, ok, secs, lab.count, noise)
+    if mem is not None:
+        mem.note("run", f"practice: {sum(r[1] for r in rows)}/{len(rows)} random worlds solved")
+        mem.record_run(dataset="practice", variables=[], experiments=0, rows=0,
+                       recalled=0, new=0, search_seconds=round(time.time() - t_start, 1))
+        mem.save()
+    return rows
+
+
+def autopilot_once(directory, out_dir, mem_path, seed, recursive, practice_n, log):
+    created, analyses = [], []
+    os.makedirs(out_dir, exist_ok=True)
+    mem = Memory(mem_path) if mem_path else None
+    pmem_path = os.path.join(out_dir, "phy_practice.json")
+    files = scan_data_files(directory, recursive)
+    log(f"[AUTOPILOT] scanning '{os.path.abspath(directory)}' -> {len(files)} candidate data file(s)")
+    tables = []
+    for p in files:
+        try:
+            t = load_any(p)
+            nnum = sum(1 for v in t.values() if np.asarray(v).dtype != object)
+            if nnum < 2 or len(next(iter(t.values()))) < 30:
+                log(f"   skipped {os.path.basename(p)}: needs >=2 numeric columns and >=30 rows")
+                continue
+            tables.append((p, t))
+            log(f"   read {os.path.basename(p)}: {len(next(iter(t.values())))} rows, "
+                f"{nnum} numeric column(s)")
+        except Exception as ex:
+            log(f"   skipped {os.path.basename(p)}: {type(ex).__name__}: {ex}")
+    if tables:
+        for gi, g in enumerate(_group_tables(tables), 1):
+            label = ",".join(os.path.basename(s) for s, _ in g["items"])[:70]
+            log(f"\n[DATASET {gi}] {label}")
+            analyses.append(analyze_group(label, g["items"], out_dir, mem, seed, f"d{gi}", log))
+        for a in analyses:
+            log("\n" + a["result"].summary())
+            for p, t in a["proposals"]:
+                log(f"   -> {os.path.basename(p)}: measurements that would best test `{t}`")
+                created.append(p)
+    else:
+        n = practice_n if practice_n is not None else 8
+        log(f"[AUTOPILOT] no usable data files found -> self-directed practice on {n} random worlds "
+            f"it invents for itself")
+        pmem = Memory(pmem_path)
+        practice(n, seed, pmem, log)
+        created.append(pmem_path)
+    rows = self_assessment(pmem_path)
+    if rows:
+        log("\n[SELF-ASSESSMENT] from its own practice: " +
+            ", ".join(f"{f} {s}/{n}" for f, s, n in rows))
+    write_artifacts(out_dir, analyses, rows, created)
+    if mem is not None:
+        created.append(mem_path)
+    log("\n[FILES CREATED]")
+    for p in dict.fromkeys(created):
+        log(f"   {os.path.abspath(p)}")
+    return analyses
+
+
+def autopilot(args, mem_path):
+    log = lambda *a: print(*a, flush=True)
+    PRIORS["named"] = PRIORS["grammar"] = bool(args.priors)
+    out_dir = args.out_dir or args.dir
+    if args.practice is not None and not args.watch:
+        os.makedirs(out_dir, exist_ok=True)
+        pm = Memory(os.path.join(out_dir, "phy_practice.json"))
+        rows = practice(args.practice, args.seed, pm, log)
+        write_artifacts(out_dir, [], self_assessment(pm.path), [])
+        log(f"[FILES CREATED] {os.path.abspath(pm.path)}, {os.path.abspath(os.path.join(out_dir, 'phy_report.md'))}")
+        return
+    if not args.watch:
+        autopilot_once(args.dir, out_dir, mem_path, args.seed, args.recursive, args.practice, log)
+        return
+    log(f"[WATCH] monitoring '{os.path.abspath(args.dir)}' every {args.poll:g}s - Ctrl-C to stop")
+    last, cycles = None, 0
+    try:
+        while True:
+            sig = tuple((p, os.path.getmtime(p), os.path.getsize(p))
+                        for p in scan_data_files(args.dir, args.recursive))
+            if sig != last:
+                last = sig
+                if not sig:
+                    log(f"[WATCH] no data files yet ({time.strftime('%H:%M:%S')}) - waiting")
+                    time.sleep(args.poll)
+                    continue
+                log(f"\n[WATCH] change detected ({time.strftime('%H:%M:%S')}) -> analysing")
+                autopilot_once(args.dir, out_dir, mem_path, args.seed, args.recursive, None, log)
+                cycles += 1
+                if args.max_cycles and cycles >= args.max_cycles:
+                    return
+            time.sleep(args.poll)
+    except KeyboardInterrupt:
+        log("\n[WATCH] stopped")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="phy_discover: find hidden relationships in data, or run an autonomous agent "
@@ -3189,7 +3879,15 @@ def main():
     ap.add_argument("--out", help="save report to .md or .json")
     ap.add_argument("--mode", choices=["agent", "data"], default=None,
                     help="built-in benchmarks: agent (V5) or data (V4 engine)")
-    ap.add_argument("--challenge", default="all",
+    ap.add_argument("--dir", default=".", help="autopilot: folder to scan for data files (default: here)")
+    ap.add_argument("--out-dir", default=None, help="autopilot: where to write the files (default: --dir)")
+    ap.add_argument("--recursive", action="store_true", help="autopilot: also scan sub-folders")
+    ap.add_argument("--watch", action="store_true", help="autopilot: keep running, re-analyse on new/changed files")
+    ap.add_argument("--poll", type=float, default=5.0, help="--watch: seconds between checks")
+    ap.add_argument("--max-cycles", type=int, default=0, help="--watch: stop after N analyses (0 = never)")
+    ap.add_argument("--practice", nargs="?", const=8, type=int, default=None, metavar="N",
+                    help="self-directed practice on N random worlds it invents (default 8)")
+    ap.add_argument("--challenge", default=None,
                     help="benchmarks. agent: law1 law3 suite pendulum composite logindex decay "
                          "arrhenius latent | all.  data: law1 law2 law3 law4 suite pendulum | all")
     ap.add_argument("--priors", action="store_true", help="allow pi/e/... constant priors")
@@ -3211,10 +3909,11 @@ def main():
     ap.add_argument("--memory-demo", metavar="CHALLENGE",
                     help="run a benchmark twice on a fresh memory and show the speed-up")
     a = ap.parse_args()
-    mpath = None if a.no_memory else (a.memory or "phy_memory.json")
+    default_mem = os.path.join(a.out_dir or a.dir, "phy_memory.json") \
+        if (a.out_dir or a.dir != ".") else "phy_memory.json"
+    mpath = None if a.no_memory else (a.memory or default_mem)
 
     if a.memory_reset:
-        import os
         if os.path.exists(mpath or "phy_memory.json"):
             os.remove(mpath or "phy_memory.json")
         print("memory reset:", mpath or "phy_memory.json")
@@ -3228,7 +3927,7 @@ def main():
         print(m.describe(a.memory_notes))
         return
     if a.memory_demo:
-        import tempfile, os
+        import tempfile
         PRIORS["named"] = PRIORS["grammar"] = a.priors
         path = os.path.join(tempfile.mkdtemp(), "demo_memory.json")
         rows = []
@@ -3271,7 +3970,13 @@ def main():
             print("saved", res.save(a.out))
         return
 
-    # ---- built-in benchmarks ----
+    # ---- AUTOPILOT: no instructions given -> find the data and do everything ----
+    if a.challenge is None and a.mode is None:
+        autopilot(a, mpath)
+        return
+    a.challenge = a.challenge or "all"
+
+    # ---- built-in benchmarks (simulated worlds written by the developer, for self-testing) ----
     mode = a.mode or "agent"
     if mode == "data":
         cfg = Config(seed=a.seed)
@@ -3295,6 +4000,11 @@ def main():
     print("\n" + "=" * 78 + "\nAUTONOMOUS BENCHMARK SUMMARY")
     for n, ok in res.items():
         print(f"  {n:10s} {'RECOVERED' if ok else 'MISSED'}")
+    bp = os.path.join(a.out_dir or ".", "phy_benchmark.json")
+    with open(bp, "w") as f:
+        json.dump(dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), seed=a.seed,
+                       results={k: bool(v) for k, v in res.items()}), f, indent=1)
+    print(f"[FILE CREATED] {os.path.abspath(bp)}")
 
 
 if __name__ == "__main__":
