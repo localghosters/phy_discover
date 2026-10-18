@@ -3,7 +3,39 @@
 Finds simple, accurate, non-redundant mathematical relationships hidden in measurements,
 or runs an agent that designs its own experiments to find them. One file, NumPy only.
 
-## Use it on your data
+## Autopilot: just run it
+
+```bash
+python phy_discover.py            # look in this folder, work everything out, write the files
+python phy_discover.py --dir data/ --recursive
+python phy_discover.py --watch    # keep running; re-analyse whenever a file appears or changes
+python phy_discover.py --practice 12   # self-directed practice (also what it does if there is no data)
+```
+
+With no instructions it:
+
+1. **finds the data**: `.csv .tsv .txt .json .npz` in the folder (its own `phy_*` files are ignored);
+   unreadable or too-small files are skipped and say why
+2. **works out the structure**: several files with the same columns are separate experiments; one file
+   with a run/trial/batch/... label column (or a text column with >=2 groups of >=30 rows) is split into
+   experiments; index columns, text columns and exact scaled copies of another column are dropped
+3. **reads units from headers** such as `g [m/s^2]` or `T (K)` and switches dimensional analysis on
+   (relations whose terms have different dimensions are rejected)
+4. **picks the accuracy bar itself**: tries 2%, then 5%, then 10%, so noisy data is not silently ignored,
+   and on pure noise it still reports nothing
+5. **handles variables set once per experiment** (gravity per planet, temperature per run)
+6. **discovers, merges equivalent forms, and recalls what it already knew** (memory)
+7. **asks for what it needs next**: `phy_next_experiments_*.csv` lists the settings that would best
+   separate the surviving hypotheses (set the inputs, measure the sensitive quantity)
+8. **practises when there is nothing to analyse**: it invents random hidden laws for itself, tries to
+   find them, and records which kinds it can and cannot find in `phy_practice.json`; that self-assessment
+   is appended to every report
+
+Files it creates in the folder: `phy_memory.json`, `phy_report.md`, `phy_report.json`,
+`phy_next_experiments_*.csv`, `phy_practice.json` (practice only), `phy_benchmark.json` (benchmarks).
+`--out-dir` puts them elsewhere; `--no-memory` skips the memory file.
+
+## Use it on specific data (explicit control)
 
 ```bash
 python phy_discover.py --csv run1.csv run2.csv run3.csv --out report.md   # one file = one experiment
@@ -90,11 +122,19 @@ novelty scores.
 ## Benchmarks
 
 ```bash
-python phy_discover.py                          # 12 autonomous hidden-law challenges + latent variable (~16 s)
+python phy_discover.py --challenge all          # 12 hidden-law challenges + latent variable (~16 s)
 python phy_discover.py --mode data --challenge all
 ```
 
 ## Limits (read before trusting a result)
+
+* **Autopilot heuristics can guess wrong.** Experiment-label detection needs a name hint (run, trial,
+  batch, ...) for numeric columns, or a text column; unit parsing knows common SI symbols only; proposals
+  are only made for explicit laws. Everything it decided is printed (`[auto]`) and written to the report, so
+  check it.
+* **Practice measures itself, not nature.** The random worlds are written by this program from the law
+  families it already searches, so the self-assessment is an honest check on those families and says
+  nothing about laws outside them.
 
 * Search vocabulary: powers, products, ratios, logs, exp of a power, (damped) sin/cos of a single
   input (additively combined with other terms). Not an amplitude that depends on another variable
