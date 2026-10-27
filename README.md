@@ -1,4 +1,4 @@
-# phy_discover
+# phy_discover 
 
 Finds simple, accurate, non-redundant mathematical relationships hidden in measurements,
 or runs an agent that designs its own experiments to find them. One file, NumPy only.
